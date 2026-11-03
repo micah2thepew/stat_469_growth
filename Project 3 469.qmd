@@ -17,7 +17,7 @@ library(patchwork)
 library(lmtest)
 library(prophet)
 
-data <- vroom("C:/Users/decca/Downloads/CompanyGrowth.csv")
+data <- vroom("CompanyGrowth.csv")
 head(data)
 ```
 
