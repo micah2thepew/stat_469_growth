@@ -1,0 +1,217 @@
+---
+title: "VistaLux Entertainment: 2025 Growth Outlook and Modeling Methodology"
+format:
+  typst:
+    fig-format: png
+author: Callie Mueller, Micah Pew, Aidan Christensen
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+library(vroom)
+library(tidyverse)
+library(forecast)
+library(patchwork)
+library(lmtest)
+library(prophet)
+
+data <- vroom("C:/Users/decca/Downloads/CompanyGrowth.csv")
+head(data)
+```
+
+```{r}
+# Fitting the current model 
+current_model <- lm(PctGrowth ~ Income + Production + Savings + Unemployment, data = data)
+
+# Viewing the model coefficients 
+summary(current_model)
+```
+
+```{r}
+# Evaluating Model Performance (RMSE and ACF)
+data <- data %>%
+  mutate(fitted_vals = fitted(current_model),
+         resids = residuals(current_model))
+
+rmse_current <- sqrt(mean(data$resids^2))
+print(paste("Current Model RMSE:", round(rmse_current, 4)))
+
+# Diagnostic Plots
+p_acf <- forecast::ggAcf(data$resids) +
+  labs(title = "ACF of MLR Residuals")
+
+p_res <- ggplot(data, aes(x = fitted_vals, y = resids)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals vs Fitted", x = "Fitted Values", y = "Residuals")
+
+p_hist <- ggplot(data, aes(x = resids)) +
+  geom_histogram(bins = 15, fill = "darkgray", color = "black") +
+  labs(title = "Histogram", x = "Residuals", y = "Count")
+
+bptest(current_model)
+
+# Combine plots side-by-side using patchwork
+p_acf | p_res | p_hist
+
+# Shapiro-Wilk Test for Normality
+sw_test <- shapiro.test(data$resids)
+print(sw_test)
+
+# 2025 Macroeconomic Predictor Forecasts using Linear Trends
+lm_income <- lm(Income ~ Year + Qrtr, data = data)
+lm_production <- lm(Production ~ Year + Qrtr, data = data)
+lm_savings <- lm(Savings ~ Year + Qrtr, data = data)
+lm_unemp <- lm(Unemployment ~ Year + Qrtr, data = data)
+
+# 2025 Dataframe and Predict PctGrowth
+future_time <- data.frame(Year = rep(2025, 4), Qrtr = 1:4)
+
+data_2025 <- data.frame(
+  Year = 2025,
+  Qrtr = 1:4,
+  Income = predict(lm_income, newdata = future_time),
+  Production = predict(lm_production, newdata = future_time),
+  Savings = predict(lm_savings, newdata = future_time),
+  Unemployment = predict(lm_unemp, newdata = future_time)
+)
+
+# Predictions using the current_model
+predictions_2025 <- predict(current_model, newdata = data_2025, interval = "prediction")
+
+data_2025 <- data_2025 %>%
+  mutate(
+    Predicted_PctGrowth = predictions_2025[, "fit"],
+    Lower_PI = predictions_2025[, "lwr"],
+    Upper_PI = predictions_2025[, "upr"]
+  )
+
+print(data_2025)
+```
+
+```{r}
+library(forecast)
+library(tidyverse)
+
+# ---- 0. Keep only data through 2024 (2025 is what we're forecasting) ----
+data_hist <- data %>% filter(Year <= 2024)
+
+# ---- 1. Holdout split: train through 2023, test on 2024 ----
+train <- data_hist %>% filter(Year < 2024)
+test  <- data_hist %>% filter(Year == 2024)
+
+# ---- 2. Turn training growth into a quarterly time series ----
+y_train <- ts(train$PctGrowth,
+              start = c(train$Year[1], train$Qrtr[1]),
+              frequency = 4)
+
+# ---- 3. Look at the series: plot, ACF, PACF ----
+ggtsdisplay(y_train)
+
+# ---- 4. Fit the SARIMA on the training data ----
+fit_sarima <- auto.arima(y_train, seasonal = TRUE)
+summary(fit_sarima)
+
+# ---- 5. Check the residuals (want white noise) ----
+checkresiduals(fit_sarima)
+
+# ---- 6. Holdout accuracy: forecast 2024, compare to actual ----
+fc_test <- forecast(fit_sarima, h = nrow(test), level = 95)
+rmse_sarima <- sqrt(mean((test$PctGrowth - fc_test$mean)^2))
+rmse_sarima
+
+actual_test <- ts(test$PctGrowth,
+                  start = c(test$Year[1], test$Qrtr[1]),
+                  frequency = 4)
+autoplot(fc_test) +
+  autolayer(actual_test, series = "Actual") +
+  coord_cartesian(xlim = c(2015, 2025))   # zoomed in so the forecast is visible
+
+# ---- 7. 2025 projections: refit on ALL data through 2024 ----
+y_all <- ts(data_hist$PctGrowth,
+            start = c(data_hist$Year[1], data_hist$Qrtr[1]),
+            frequency = 4)
+fit_all <- auto.arima(y_all, seasonal = TRUE)
+summary(fit_all)
+
+fc_2025 <- forecast(fit_all, h = 4, level = 95)
+
+sarima_2025 <- data.frame(
+  Year = 2025,
+  Qrtr = 1:4,
+  Model = "SARIMA",
+  Predicted = as.numeric(fc_2025$mean),
+  Lower_95 = as.numeric(fc_2025$lower),
+  Upper_95 = as.numeric(fc_2025$upper)
+)
+sarima_2025
+```
+```{r}
+checkresiduals(fit_all)
+
+rmse_mean <- sqrt(mean((test$PctGrowth - mean(train$PctGrowth))^2))
+rmse_mean
+```
+
+```{r}
+
+# Uses data_hist, train, and test from your SARIMA script (all filtered to Year <= 2024)
+
+# ---- 1. Prophet needs a date column `ds` and a value column `y` ----
+# Each quarter becomes the first day of that quarter (Q1 -> Jan 1, Q2 -> Apr 1, ...)
+add_prophet_cols <- function(df) {
+  df %>% mutate(ds = as.Date(paste(Year, (Qrtr - 1) * 3 + 1, 1, sep = "-")),
+                y  = PctGrowth)
+}
+train_p <- add_prophet_cols(train)
+test_p  <- add_prophet_cols(test)
+all_p   <- add_prophet_cols(data_hist)
+
+# ---- 2. Fit on the training data ----
+set.seed(469)
+m_test <- prophet(train_p,
+                  weekly.seasonality = FALSE,   # no weekly pattern in quarterly data
+                  daily.seasonality  = FALSE,
+                  yearly.seasonality = 2,       # a few terms is plenty for 4 points/year
+                  interval.width     = 0.95)    # match the SARIMA 95% intervals
+
+# ---- 3. Look at the fit and the pieces Prophet found ----
+fit_in <- predict(m_test)                       # in-sample fit
+plot(m_test, fit_in)
+prophet_plot_components(m_test, fit_in)         # trend + yearly seasonality
+
+# ---- 4. Residual check on the training data ----
+prophet_resids <- train_p$y - fit_in$yhat
+forecast::ggAcf(prophet_resids) + labs(title = "Prophet residuals ACF")
+shapiro.test(prophet_resids)
+
+# ---- 5. Holdout accuracy: forecast 2024, compare to actual ----
+fc_test_p <- predict(m_test, test_p %>% select(ds))
+rmse_prophet <- sqrt(mean((test$PctGrowth - fc_test_p$yhat)^2))
+rmse_prophet
+
+# ---- 6. 2025 projections: refit on ALL data through 2024 ----
+set.seed(469)
+m_all <- prophet(all_p,
+                 weekly.seasonality = FALSE,
+                 daily.seasonality  = FALSE,
+                 yearly.seasonality = 2,
+                 interval.width     = 0.95)
+
+future_2025 <- data.frame(ds = as.Date(c("2025-01-01", "2025-04-01",
+                                         "2025-07-01", "2025-10-01")))
+fc_2025_p <- predict(m_all, future_2025)
+
+prophet_2025 <- data.frame(
+  Year = 2025,
+  Qrtr = 1:4,
+  Model = "Prophet",
+  Predicted = fc_2025_p$yhat,
+  Lower_95 = fc_2025_p$yhat_lower,
+  Upper_95 = fc_2025_p$yhat_upper
+)
+prophet_2025
+```
+
