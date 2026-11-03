@@ -15,82 +15,149 @@ library(tidyverse)
 library(forecast)
 library(patchwork)
 library(lmtest)
-library(prophet)
 
-data <- vroom("CompanyGrowth.csv")
-head(data)
+dir.create("figures", showWarnings = FALSE)
+
+data <- vroom("C:/Users/aidan/Downloads/CompanyGrowth.csv") %>%
+  mutate(Qrtr = factor(Qrtr))
+
+data_historical <- data %>% filter(Year <= 2024)
+
+predictors <- c("Income", "Production", "Savings", "Unemployment")
 ```
 
 ```{r}
-# Fitting the current model 
-current_model <- lm(PctGrowth ~ Income + Production + Savings + Unemployment, data = data)
+forecast_growth <- function(train, test) {
+  X <- test
+  for (v in predictors) {
+    f <- as.formula(paste(v, "~ Year + Qrtr"))
+    X[[v]] <- predict(lm(f, data = train), newdata = test)
+  }
+  growth_fit <- lm(PctGrowth ~ Income + Production + Savings + Unemployment,
+                   data = train)
+  predict(growth_fit, newdata = X)
+}
 
-# Viewing the model coefficients 
+rmse <- function(actual, pred) sqrt(mean((actual - pred)^2))
+
+holdout_results <- function(cut_year) {
+  tr <- data_historical %>% filter(Year < cut_year)
+  te <- data_historical %>% filter(Year >= cut_year)
+
+  known_fit <- lm(PctGrowth ~ Income + Production + Savings + Unemployment,
+                  data = tr)
+
+  tibble(
+    holdout         = paste0(cut_year, "-2024"),
+    n_quarters      = nrow(te),
+    rmse_model      = rmse(te$PctGrowth, forecast_growth(tr, te)),
+    rmse_if_X_known = rmse(te$PctGrowth, predict(known_fit, newdata = te)),
+    rmse_mean_only  = rmse(te$PctGrowth, mean(tr$PctGrowth))
+  )
+}
+
+bind_rows(holdout_results(2024), holdout_results(2020)) %>%
+  mutate(across(starts_with("rmse"), ~ round(.x, 3)))
+```
+
+```{r}
+current_model <- lm(PctGrowth ~ Income + Production + Savings + Unemployment,
+                    data = data_historical)
 summary(current_model)
 ```
 
 ```{r}
-# Evaluating Model Performance (RMSE and ACF)
-data <- data %>%
+data_historical <- data_historical %>%
   mutate(fitted_vals = fitted(current_model),
-         resids = residuals(current_model))
+         resids = residuals(current_model),
+         time = Year + (as.numeric(as.character(Qrtr)) - 1) / 4)
 
-rmse_current <- sqrt(mean(data$resids^2))
-print(paste("Current Model RMSE:", round(rmse_current, 4)))
+title_theme <- theme(plot.title = element_text(size = 10))
 
-# Diagnostic Plots
-p_acf <- forecast::ggAcf(data$resids) +
-  labs(title = "ACF of MLR Residuals")
+p_acf <- forecast::ggAcf(data_historical$resids) +
+  labs(title = "ACF of MLR Residuals") + title_theme
 
-p_res <- ggplot(data, aes(x = fitted_vals, y = resids)) +
+p_res <- ggplot(data_historical, aes(x = fitted_vals, y = resids)) +
   geom_point() +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
-  labs(title = "Residuals vs Fitted", x = "Fitted Values", y = "Residuals")
+  labs(title = "Residuals vs Fitted", x = "Fitted Values", y = "Residuals") +
+  title_theme
 
-p_hist <- ggplot(data, aes(x = resids)) +
+p_hist <- ggplot(data_historical, aes(x = resids)) +
   geom_histogram(bins = 15, fill = "darkgray", color = "black") +
-  labs(title = "Histogram", x = "Residuals", y = "Count")
+  labs(title = "Histogram", x = "Residuals", y = "Count") + title_theme
 
-bptest(current_model)
+p_qq <- ggplot(data_historical, aes(sample = resids)) +
+  stat_qq() + stat_qq_line(color = "red") +
+  labs(title = "Normal QQ Plot", x = "Theoretical", y = "Sample") + title_theme
 
-# Combine plots side-by-side using patchwork
-p_acf | p_res | p_hist
+p_time <- ggplot(data_historical, aes(x = time, y = resids)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals Over Time", x = "Year", y = "Residuals") + title_theme
 
-# Shapiro-Wilk Test for Normality
-sw_test <- shapiro.test(data$resids)
-print(sw_test)
+(p_acf | p_res | p_hist) / (p_qq | p_time)
 
-# 2025 Macroeconomic Predictor Forecasts using Linear Trends
-lm_income <- lm(Income ~ Year + Qrtr, data = data)
-lm_production <- lm(Production ~ Year + Qrtr, data = data)
-lm_savings <- lm(Savings ~ Year + Qrtr, data = data)
-lm_unemp <- lm(Unemployment ~ Year + Qrtr, data = data)
+print(shapiro.test(data_historical$resids))
+print(bptest(current_model))
+print(dwtest(current_model))
+print(Box.test(data_historical$resids, lag = 8, type = "Ljung-Box"))
+```
 
-# 2025 Dataframe and Predict PctGrowth
-future_time <- data.frame(Year = rep(2025, 4), Qrtr = 1:4)
+```{r}
+lm_income     <- lm(Income ~ Year + Qrtr,       data = data_historical)
+lm_production <- lm(Production ~ Year + Qrtr,   data = data_historical)
+lm_savings    <- lm(Savings ~ Year + Qrtr,      data = data_historical)
+lm_unemp      <- lm(Unemployment ~ Year + Qrtr, data = data_historical)
+
+future_time <- data.frame(Year = rep(2025, 4), Qrtr = factor(1:4))
 
 data_2025 <- data.frame(
   Year = 2025,
-  Qrtr = 1:4,
-  Income = predict(lm_income, newdata = future_time),
-  Production = predict(lm_production, newdata = future_time),
-  Savings = predict(lm_savings, newdata = future_time),
+  Qrtr = factor(1:4),
+  Income       = predict(lm_income, newdata = future_time),
+  Production   = predict(lm_production, newdata = future_time),
+  Savings      = predict(lm_savings, newdata = future_time),
   Unemployment = predict(lm_unemp, newdata = future_time)
 )
 
-# Predictions using the current_model
-predictions_2025 <- predict(current_model, newdata = data_2025, interval = "prediction")
+predictions_2025 <- predict(current_model, newdata = data_2025,
+                            interval = "prediction")
 
 data_2025 <- data_2025 %>%
-  mutate(
-    Predicted_PctGrowth = predictions_2025[, "fit"],
-    Lower_PI = predictions_2025[, "lwr"],
-    Upper_PI = predictions_2025[, "upr"]
-  )
+  mutate(Predicted_PctGrowth = predictions_2025[, "fit"],
+         Lower_PI_old = predictions_2025[, "lwr"],
+         Upper_PI_old = predictions_2025[, "upr"])
 
-print(data_2025)
+# Simulation interval that includes uncertainty in the forecasted predictors
+pred_models <- list(Income = lm_income, Production = lm_production,
+                    Savings = lm_savings, Unemployment = lm_unemp)
+pred_resids <- sapply(pred_models, residuals)
+beta <- coef(current_model)
+growth_resids <- residuals(current_model)
+
+set.seed(469)
+B <- 5000
+
+sim_summary <- map_dfr(1:4, function(q) {
+  idx <- sample(nrow(pred_resids), B, replace = TRUE)
+  base <- unlist(data_2025[q, predictors])
+  Xq <- sweep(pred_resids[idx, predictors], 2, base, "+")
+  sims <- as.vector(cbind(1, Xq) %*% beta) +
+    sample(growth_resids, B, replace = TRUE)
+  tibble(Qrtr = q,
+         Lower_PI_sim = quantile(sims, 0.025),
+         Upper_PI_sim = quantile(sims, 0.975))
+}) %>% mutate(Qrtr = factor(Qrtr))
+
+data_2025 <- left_join(data_2025, sim_summary, by = "Qrtr")
+print(data_2025 %>%
+        select(Year, Qrtr, Predicted_PctGrowth, starts_with("Lower"),
+               starts_with("Upper")))
 ```
 
+
+CAllies Part 
 ```{r}
 library(forecast)
 library(tidyverse)
