@@ -16,13 +16,12 @@ library(forecast)
 library(patchwork)
 library(lmtest)
 library(prophet)
-library(patchwork)
 
 predictors <- c("Income", "Production", "Savings", "Unemployment")
 
 dir.create("figures", showWarnings = FALSE)
 
-data <- vroom("C:/Users/decca/Downloads/CompanyGrowth.csv") %>%
+data <- vroom("C:/Users/aidan/Downloads/CompanyGrowth.csv") %>%
   mutate(Qrtr = factor(Qrtr))
 
 data_all <- data %>%
@@ -46,9 +45,8 @@ future_all <- make_future(data_all)
 future_all   # CHECK: these are the quarters being projected
 
 ts_of <- function(x, df) ts(x, start = c(df$Year[1], df$q[1]), frequency = 4)
-rmse  <- function(actual, pred) sqrt(mean((actual - pred)^2))
+mae   <- function(actual, pred) mean(abs(actual - pred))
 ```
-
 
 ```{r}
 forecast_growth <- function(train, test) {
@@ -62,11 +60,9 @@ forecast_growth <- function(train, test) {
   predict(growth_fit, newdata = X)
 }
 
-rmse <- function(actual, pred) sqrt(mean((actual - pred)^2))
-
 holdout_results <- function(cut_year) {
-  tr <- data_historical %>% filter(Year < cut_year)
-  te <- data_historical %>% filter(Year >= cut_year)
+  tr <- data_all %>% filter(Year < cut_year)
+  te <- data_all %>% filter(Year >= cut_year)
 
   known_fit <- lm(PctGrowth ~ Income + Production + Savings + Unemployment,
                   data = tr)
@@ -74,77 +70,74 @@ holdout_results <- function(cut_year) {
   tibble(
     holdout         = paste0(cut_year, "-2024"),
     n_quarters      = nrow(te),
-    rmse_model      = rmse(te$PctGrowth, forecast_growth(tr, te)),
-    rmse_if_X_known = rmse(te$PctGrowth, predict(known_fit, newdata = te)),
-    rmse_mean_only  = rmse(te$PctGrowth, mean(tr$PctGrowth))
+    mae_model       = mae(te$PctGrowth, forecast_growth(tr, te)),
+    mae_if_X_known  = mae(te$PctGrowth, predict(known_fit, newdata = te)),
+    mae_mean_only   = mae(te$PctGrowth, mean(tr$PctGrowth))
   )
 }
 
 bind_rows(holdout_results(2024), holdout_results(2020)) %>%
-  mutate(across(starts_with("rmse"), ~ round(.x, 3)))
+  mutate(across(starts_with("mae"), ~ round(.x, 3)))
 ```
+
 ```{r}
 current_model <- lm(PctGrowth ~ Income + Production + Savings + Unemployment,
-                    data = data_historical)
+                    data = data_all)
 summary(current_model)
 ```
 
-
 ```{r}
-data_historical <- data_historical %>%
+data_all <- data_all %>%
   mutate(fitted_vals = fitted(current_model),
          resids = residuals(current_model),
          time = Year + (as.numeric(as.character(Qrtr)) - 1) / 4)
 
 title_theme <- theme(plot.title = element_text(size = 10))
 
-p_acf <- forecast::ggAcf(data_historical$resids) +
+p_acf <- forecast::ggAcf(data_all$resids) +
   labs(title = "ACF of MLR Residuals") + title_theme
 
-p_res <- ggplot(data_historical, aes(x = fitted_vals, y = resids)) +
+p_res <- ggplot(data_all, aes(x = fitted_vals, y = resids)) +
   geom_point() +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
   labs(title = "Residuals vs Fitted", x = "Fitted Values", y = "Residuals") +
   title_theme
 
-p_hist <- ggplot(data_historical, aes(x = resids)) +
+p_hist <- ggplot(data_all, aes(x = resids)) +
   geom_histogram(bins = 15, fill = "darkgray", color = "black") +
   labs(title = "Histogram", x = "Residuals", y = "Count") + title_theme
 
-p_qq <- ggplot(data_historical, aes(sample = resids)) +
+p_qq <- ggplot(data_all, aes(sample = resids)) +
   stat_qq() + stat_qq_line(color = "red") +
   labs(title = "Normal QQ Plot", x = "Theoretical", y = "Sample") + title_theme
 
-p_time <- ggplot(data_historical, aes(x = time, y = resids)) +
+p_time <- ggplot(data_all, aes(x = time, y = resids)) +
   geom_point() +
   geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
   labs(title = "Residuals Over Time", x = "Year", y = "Residuals") + title_theme
 
 (p_acf | p_res | p_hist) / (p_qq | p_time)
 
-print(shapiro.test(data_historical$resids))
+print(shapiro.test(data_all$resids))
 print(bptest(current_model))
 print(dwtest(current_model))
-print(Box.test(data_historical$resids, lag = 8, type = "Ljung-Box"))
+print(Box.test(data_all$resids, lag = 8, type = "Ljung-Box"))
 ```
 
-
 ```{r}
-lm_income     <- lm(Income ~ Year + Qrtr,       data = data_historical)
-lm_production <- lm(Production ~ Year + Qrtr,   data = data_historical)
-lm_savings    <- lm(Savings ~ Year + Qrtr,      data = data_historical)
-lm_unemp      <- lm(Unemployment ~ Year + Qrtr, data = data_historical)
+lm_income     <- lm(Income ~ Year + Qrtr,       data = data_all)
+lm_production <- lm(Production ~ Year + Qrtr,   data = data_all)
+lm_savings    <- lm(Savings ~ Year + Qrtr,      data = data_all)
+lm_unemp      <- lm(Unemployment ~ Year + Qrtr, data = data_all)
 
-future_time <- data.frame(Year = rep(2025, 4), Qrtr = factor(1:4))
-
-data_2025 <- data.frame(
-  Year = 2025,
-  Qrtr = factor(1:4),
-  Income       = predict(lm_income, newdata = future_time),
-  Production   = predict(lm_production, newdata = future_time),
-  Savings      = predict(lm_savings, newdata = future_time),
-  Unemployment = predict(lm_unemp, newdata = future_time)
-)
+# Predict using future_all (which holds only Q3 and Q4)
+data_2025 <- future_all %>%
+  mutate(
+    Income       = predict(lm_income, newdata = future_all),
+    Production   = predict(lm_production, newdata = future_all),
+    Savings      = predict(lm_savings, newdata = future_all),
+    Unemployment = predict(lm_unemp, newdata = future_all)
+  )
 
 predictions_2025 <- predict(current_model, newdata = data_2025,
                             interval = "prediction")
@@ -164,26 +157,28 @@ growth_resids <- residuals(current_model)
 set.seed(469)
 B <- 5000
 
-sim_summary <- map_dfr(1:4, function(q) {
+# Dynamically map over the remaining future quarters
+quarters_to_predict <- as.numeric(as.character(data_2025$Qrtr))
+
+sim_summary <- map_dfr(1:nrow(data_2025), function(i) {
+  q_val <- quarters_to_predict[i]
   idx <- sample(nrow(pred_resids), B, replace = TRUE)
-  base <- unlist(data_2025[q, predictors])
+  base <- unlist(data_2025[i, predictors])
+  
   Xq <- sweep(pred_resids[idx, predictors], 2, base, "+")
   sims <- as.vector(cbind(1, Xq) %*% beta) +
     sample(growth_resids, B, replace = TRUE)
-  tibble(Qrtr = q,
+  
+  tibble(Qrtr = q_val,
          Lower_PI_sim = quantile(sims, 0.025),
          Upper_PI_sim = quantile(sims, 0.975))
-}) %>% mutate(Qrtr = factor(Qrtr))
+}) %>% mutate(Qrtr = factor(Qrtr, levels = levels(data_all$Qrtr)))
 
 data_2025 <- left_join(data_2025, sim_summary, by = "Qrtr")
 print(data_2025 %>%
         select(Year, Qrtr, Predicted_PctGrowth, starts_with("Lower"),
                starts_with("Upper")))
 ```
-
-
-
-
 
 ```{r}
 #sarima
@@ -205,15 +200,11 @@ sarima_forecast <- function(train, future) {
   list(fit = fit, X_future = X_future,
        out = tibble(Year = future$Year, Qrtr = future$Qrtr, Model = "SARIMA + xreg",
                     Predicted = as.numeric(fc$mean),
-                    Lower_95  = as.numeric(fc$lower),
-                    Upper_95  = as.numeric(fc$upper)))
+                    Lower_95  = as.numeric(fc$lower), Upper_95  = as.numeric(fc$upper)))
 }
-
 ```
 
-
 ```{r}
-
 fit_prophet <- function(df, regressors = NULL) {
   m <- prophet(weekly.seasonality = FALSE, daily.seasonality = FALSE,
                yearly.seasonality = 2, interval.width = 0.95, fit = FALSE)
@@ -239,12 +230,9 @@ prophet_forecast <- function(train, future, seed = 469) {
   list(model = m, X_future = X_future,
        out = tibble(Year = future$Year, Qrtr = future$Qrtr, Model = "Prophet + regressors",
                     Predicted = pred$yhat,
-                    Lower_95  = pred$yhat_lower,
-                    Upper_95  = pred$yhat_upper))
+                    Lower_95  = pred$yhat_lower, Upper_95  = pred$yhat_upper))
 }
-
 ```
-
 
 ```{r}
 holdout_sarima_prophet <- function(cut_year) {
@@ -256,14 +244,15 @@ holdout_sarima_prophet <- function(cut_year) {
 
   tibble(holdout = paste0(cut_year, "-", max(te$Year)),
          n_quarters = nrow(te),
-         rmse_sarima  = rmse(te$PctGrowth, sar),
-         rmse_prophet = rmse(te$PctGrowth, pro))
+         mae_sarima  = mae(te$PctGrowth, sar),
+         mae_prophet = mae(te$PctGrowth, pro))
 }
 
 comparison_new <- bind_rows(holdout_sarima_prophet(2024), holdout_sarima_prophet(2020)) %>%
-  mutate(across(starts_with("rmse"), ~ round(.x, 3)))
+  mutate(across(starts_with("mae"), ~ round(.x, 3)))
 comparison_new
 ```
+
 ```{r}
 sarima_final  <- sarima_forecast(data_all, future_all)
 prophet_final <- prophet_forecast(data_all, future_all)
@@ -277,7 +266,6 @@ sarima_final$X_future
 prophet_final$X_future
 ```
 
-
 ```{r}
 checkresiduals(sarima_final$fit)
 sarima_resids <- as.numeric(residuals(sarima_final$fit))
@@ -290,16 +278,3 @@ forecast::ggAcf(prophet_resids) + labs(title = "ACF of Prophet Residuals")
 shapiro.test(prophet_resids)
 Box.test(prophet_resids, lag = 8, type = "Ljung-Box")
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
