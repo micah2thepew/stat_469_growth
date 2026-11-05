@@ -15,16 +15,40 @@ library(tidyverse)
 library(forecast)
 library(patchwork)
 library(lmtest)
+library(prophet)
+library(patchwork)
+
+predictors <- c("Income", "Production", "Savings", "Unemployment")
 
 dir.create("figures", showWarnings = FALSE)
 
-data <- vroom("C:/Users/aidan/Downloads/CompanyGrowth.csv") %>%
+data <- vroom("C:/Users/decca/Downloads/CompanyGrowth.csv") %>%
   mutate(Qrtr = factor(Qrtr))
 
-data_historical <- data %>% filter(Year <= 2024)
+data_all <- data %>%
+  filter(!is.na(PctGrowth), if_all(all_of(predictors), ~ !is.na(.x))) %>%
+  mutate(q  = as.numeric(as.character(Qrtr)),
+         ds = as.Date(paste(Year, (q - 1) * 3 + 1, 1, sep = "-")),
+         y  = PctGrowth) %>%
+  arrange(ds)
 
-predictors <- c("Income", "Production", "Savings", "Unemployment")
+tail(data_all)
 ```
+
+```{r}
+make_future <- function(train, end_date = as.Date("2025-10-01")) {
+  tibble(ds = seq(max(train$ds), end_date, by = "quarter")[-1]) %>%
+    mutate(Year = year(ds),
+           Qrtr = factor(quarter(ds), levels = levels(train$Qrtr)))
+}
+
+future_all <- make_future(data_all)
+future_all   # CHECK: these are the quarters being projected
+
+ts_of <- function(x, df) ts(x, start = c(df$Year[1], df$q[1]), frequency = 4)
+rmse  <- function(actual, pred) sqrt(mean((actual - pred)^2))
+```
+
 
 ```{r}
 forecast_growth <- function(train, test) {
@@ -59,12 +83,12 @@ holdout_results <- function(cut_year) {
 bind_rows(holdout_results(2024), holdout_results(2020)) %>%
   mutate(across(starts_with("rmse"), ~ round(.x, 3)))
 ```
-
 ```{r}
 current_model <- lm(PctGrowth ~ Income + Production + Savings + Unemployment,
                     data = data_historical)
 summary(current_model)
 ```
+
 
 ```{r}
 data_historical <- data_historical %>%
@@ -103,6 +127,7 @@ print(bptest(current_model))
 print(dwtest(current_model))
 print(Box.test(data_historical$resids, lag = 8, type = "Ljung-Box"))
 ```
+
 
 ```{r}
 lm_income     <- lm(Income ~ Year + Qrtr,       data = data_historical)
@@ -157,128 +182,124 @@ print(data_2025 %>%
 ```
 
 
-CAllies Part 
-```{r}
-library(forecast)
-library(tidyverse)
 
-# ---- 0. Keep only data through 2024 (2025 is what we're forecasting) ----
-data_hist <- data %>% filter(Year <= 2024)
 
-# ---- 1. Holdout split: train through 2023, test on 2024 ----
-train <- data_hist %>% filter(Year < 2024)
-test  <- data_hist %>% filter(Year == 2024)
-
-# ---- 2. Turn training growth into a quarterly time series ----
-y_train <- ts(train$PctGrowth,
-              start = c(train$Year[1], train$Qrtr[1]),
-              frequency = 4)
-
-# ---- 3. Look at the series: plot, ACF, PACF ----
-ggtsdisplay(y_train)
-
-# ---- 4. Fit the SARIMA on the training data ----
-fit_sarima <- auto.arima(y_train, seasonal = TRUE)
-summary(fit_sarima)
-
-# ---- 5. Check the residuals (want white noise) ----
-checkresiduals(fit_sarima)
-
-# ---- 6. Holdout accuracy: forecast 2024, compare to actual ----
-fc_test <- forecast(fit_sarima, h = nrow(test), level = 95)
-rmse_sarima <- sqrt(mean((test$PctGrowth - fc_test$mean)^2))
-rmse_sarima
-
-actual_test <- ts(test$PctGrowth,
-                  start = c(test$Year[1], test$Qrtr[1]),
-                  frequency = 4)
-autoplot(fc_test) +
-  autolayer(actual_test, series = "Actual") +
-  coord_cartesian(xlim = c(2015, 2025))   # zoomed in so the forecast is visible
-
-# ---- 7. 2025 projections: refit on ALL data through 2024 ----
-y_all <- ts(data_hist$PctGrowth,
-            start = c(data_hist$Year[1], data_hist$Qrtr[1]),
-            frequency = 4)
-fit_all <- auto.arima(y_all, seasonal = TRUE)
-summary(fit_all)
-
-fc_2025 <- forecast(fit_all, h = 4, level = 95)
-
-sarima_2025 <- data.frame(
-  Year = 2025,
-  Qrtr = 1:4,
-  Model = "SARIMA",
-  Predicted = as.numeric(fc_2025$mean),
-  Lower_95 = as.numeric(fc_2025$lower),
-  Upper_95 = as.numeric(fc_2025$upper)
-)
-sarima_2025
-```
-```{r}
-checkresiduals(fit_all)
-
-rmse_mean <- sqrt(mean((test$PctGrowth - mean(train$PctGrowth))^2))
-rmse_mean
-```
 
 ```{r}
+#sarima
 
-# Uses data_hist, train, and test from your SARIMA script (all filtered to Year <= 2024)
-
-# ---- 1. Prophet needs a date column `ds` and a value column `y` ----
-# Each quarter becomes the first day of that quarter (Q1 -> Jan 1, Q2 -> Apr 1, ...)
-add_prophet_cols <- function(df) {
-  df %>% mutate(ds = as.Date(paste(Year, (Qrtr - 1) * 3 + 1, 1, sep = "-")),
-                y  = PctGrowth)
+sarima_forecast_X <- function(train, h) {
+  X <- sapply(predictors, function(v) {
+    as.numeric(forecast(auto.arima(ts_of(train[[v]], train), seasonal = TRUE), h = h)$mean)
+  })
+  matrix(X, nrow = h, dimnames = list(NULL, predictors))
 }
-train_p <- add_prophet_cols(train)
-test_p  <- add_prophet_cols(test)
-all_p   <- add_prophet_cols(data_hist)
 
-# ---- 2. Fit on the training data ----
-set.seed(469)
-m_test <- prophet(train_p,
-                  weekly.seasonality = FALSE,   # no weekly pattern in quarterly data
-                  daily.seasonality  = FALSE,
-                  yearly.seasonality = 2,       # a few terms is plenty for 4 points/year
-                  interval.width     = 0.95)    # match the SARIMA 95% intervals
+sarima_forecast <- function(train, future) {
+  h        <- nrow(future)
+  X_future <- sarima_forecast_X(train, h)
+  fit <- auto.arima(ts_of(train$PctGrowth, train),
+                    xreg = as.matrix(train[, predictors]), seasonal = TRUE)
+  fc <- forecast(fit, xreg = X_future, h = h, level = 95)
 
-# ---- 3. Look at the fit and the pieces Prophet found ----
-fit_in <- predict(m_test)                       # in-sample fit
-plot(m_test, fit_in)
-prophet_plot_components(m_test, fit_in)         # trend + yearly seasonality
+  list(fit = fit, X_future = X_future,
+       out = tibble(Year = future$Year, Qrtr = future$Qrtr, Model = "SARIMA + xreg",
+                    Predicted = as.numeric(fc$mean),
+                    Lower_95  = as.numeric(fc$lower),
+                    Upper_95  = as.numeric(fc$upper)))
+}
 
-# ---- 4. Residual check on the training data ----
-prophet_resids <- train_p$y - fit_in$yhat
-forecast::ggAcf(prophet_resids) + labs(title = "Prophet residuals ACF")
-shapiro.test(prophet_resids)
-
-# ---- 5. Holdout accuracy: forecast 2024, compare to actual ----
-fc_test_p <- predict(m_test, test_p %>% select(ds))
-rmse_prophet <- sqrt(mean((test$PctGrowth - fc_test_p$yhat)^2))
-rmse_prophet
-
-# ---- 6. 2025 projections: refit on ALL data through 2024 ----
-set.seed(469)
-m_all <- prophet(all_p,
-                 weekly.seasonality = FALSE,
-                 daily.seasonality  = FALSE,
-                 yearly.seasonality = 2,
-                 interval.width     = 0.95)
-
-future_2025 <- data.frame(ds = as.Date(c("2025-01-01", "2025-04-01",
-                                         "2025-07-01", "2025-10-01")))
-fc_2025_p <- predict(m_all, future_2025)
-
-prophet_2025 <- data.frame(
-  Year = 2025,
-  Qrtr = 1:4,
-  Model = "Prophet",
-  Predicted = fc_2025_p$yhat,
-  Lower_95 = fc_2025_p$yhat_lower,
-  Upper_95 = fc_2025_p$yhat_upper
-)
-prophet_2025
 ```
+
+
+```{r}
+
+fit_prophet <- function(df, regressors = NULL) {
+  m <- prophet(weekly.seasonality = FALSE, daily.seasonality = FALSE,
+               yearly.seasonality = 2, interval.width = 0.95, fit = FALSE)
+  for (r in regressors) m <- add_regressor(m, r)
+  suppressMessages(fit.prophet(m, df))
+}
+
+prophet_forecast_X <- function(train, future) {
+  out <- map(predictors, function(v) {
+    m <- fit_prophet(train %>% transmute(ds, y = .data[[v]]))
+    predict(m, future %>% select(ds))$yhat
+  })
+  names(out) <- predictors
+  as_tibble(out)
+}
+
+prophet_forecast <- function(train, future, seed = 469) {
+  set.seed(seed)
+  X_future <- prophet_forecast_X(train, future)
+  m <- fit_prophet(train %>% select(ds, y, all_of(predictors)), regressors = predictors)
+  pred <- predict(m, bind_cols(future %>% select(ds), X_future))
+
+  list(model = m, X_future = X_future,
+       out = tibble(Year = future$Year, Qrtr = future$Qrtr, Model = "Prophet + regressors",
+                    Predicted = pred$yhat,
+                    Lower_95  = pred$yhat_lower,
+                    Upper_95  = pred$yhat_upper))
+}
+
+```
+
+
+```{r}
+holdout_sarima_prophet <- function(cut_year) {
+  tr <- data_all %>% filter(Year <  cut_year)
+  te <- data_all %>% filter(Year >= cut_year)
+
+  sar <- sarima_forecast(tr, te)$out$Predicted
+  pro <- prophet_forecast(tr, te)$out$Predicted
+
+  tibble(holdout = paste0(cut_year, "-", max(te$Year)),
+         n_quarters = nrow(te),
+         rmse_sarima  = rmse(te$PctGrowth, sar),
+         rmse_prophet = rmse(te$PctGrowth, pro))
+}
+
+comparison_new <- bind_rows(holdout_sarima_prophet(2024), holdout_sarima_prophet(2020)) %>%
+  mutate(across(starts_with("rmse"), ~ round(.x, 3)))
+comparison_new
+```
+```{r}
+sarima_final  <- sarima_forecast(data_all, future_all)
+prophet_final <- prophet_forecast(data_all, future_all)
+
+proj_new <- bind_rows(sarima_final$out, prophet_final$out) %>%
+  mutate(across(c(Predicted, Lower_95, Upper_95), ~ round(.x, 2)))
+proj_new
+
+# Forecasted variable values each model used in stage 2 (useful for a slide)
+sarima_final$X_future
+prophet_final$X_future
+```
+
+
+```{r}
+checkresiduals(sarima_final$fit)
+sarima_resids <- as.numeric(residuals(sarima_final$fit))
+shapiro.test(sarima_resids)
+Box.test(sarima_resids, lag = 8, type = "Ljung-Box")
+
+prophet_resids <- data_all$y - predict(prophet_final$model,
+                                       data_all %>% select(ds, all_of(predictors)))$yhat
+forecast::ggAcf(prophet_resids) + labs(title = "ACF of Prophet Residuals")
+shapiro.test(prophet_resids)
+Box.test(prophet_resids, lag = 8, type = "Ljung-Box")
+```
+
+
+
+
+
+
+
+
+
+
+
+
 
