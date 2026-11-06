@@ -21,7 +21,7 @@ predictors <- c("Income", "Production", "Savings", "Unemployment")
 
 dir.create("figures", showWarnings = FALSE)
 
-data <- vroom("C:/Users/aidan/Downloads/CompanyGrowth.csv") %>%
+data <- vroom("data/CompanyGrowth.csv") %>%
   mutate(Qrtr = factor(Qrtr))
 
 data_all <- data %>%
@@ -278,3 +278,232 @@ forecast::ggAcf(prophet_resids) + labs(title = "ACF of Prophet Residuals")
 shapiro.test(prophet_resids)
 Box.test(prophet_resids, lag = 8, type = "Ljung-Box")
 ```
+
+```{r}
+# Extract the four predictor coefficients and their standard errors
+coefficient_table <- bind_rows(
+  tibble(
+    predictor = predictors,
+    model = "MLR",
+    estimate = as.numeric(coef(current_model)[predictors]),
+    se = sqrt(diag(vcov(current_model)))[predictors]
+  ),
+  tibble(
+    predictor = predictors,
+    model = "SARIMA",
+    estimate = as.numeric(coef(sarima_final$fit)[predictors]),
+    se = sqrt(diag(sarima_final$fit$var.coef))[predictors]
+  )
+)
+
+# Vary each predictor over its observed range
+relationship_data <- map_dfr(predictors, function(variable) {
+
+  values <- seq(
+    min(data_all[[variable]]),
+    max(data_all[[variable]]),
+    length.out = 100
+  )
+
+  reference <- median(data_all[[variable]])
+
+  crossing(
+    coefficient_table |> filter(predictor == variable),
+    value = values
+  ) |>
+    mutate(
+      change = estimate * (value - reference),
+
+      # Approximate 95% confidence intervals for the change
+      margin = 1.96 * se * abs(value - reference),
+      lower = change - margin,
+      upper = change + margin
+    )
+})
+
+# Plot the four relationships for both models
+ggplot(
+  relationship_data,
+  aes(x = value, y = change, color = model, fill = model)
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "gray60"
+  ) +
+  geom_ribbon(
+    aes(ymin = lower, ymax = upper),
+    alpha = 0.15,
+    color = NA
+  ) +
+  geom_line(aes(linewidth = model)) +
+    scale_linewidth_manual(
+    values = c("MLR" = 1.5, "SARIMA" = 1),
+    guide = "none"
+  ) +
+  facet_wrap(~ predictor, scales = "free_x") +
+  labs(
+    title = "Predictor Relationships with Company Growth",
+    subtitle = "Change relative to each predictor's median",
+    x = "Predictor value (original units)",
+    y = "Predicted change in PctGrowth",
+    color = "Model",
+    fill = "Model"
+  ) +
+  theme_minimal()
+```
+
+ 
+# Choose the model you want to present: "SARIMA" or "MLR"
+```{r}
+preferred_model <- "MLR"
+
+variable_labels <- c(
+  Income = "the disposable-income growth indicator",
+  Production = "the US production growth indicator",
+  Savings = "the personal savings change indicator",
+  Unemployment = "the unemployment-rate change indicator"
+)
+
+board_results <- coefficient_table |>
+  filter(model == preferred_model) |>
+  mutate(
+    lower = estimate - 1.96 * se,
+    upper = estimate + 1.96 * se,
+
+    statement = paste0(
+      "A one-unit increase in ",
+      variable_labels[predictor],
+      " is associated with ",
+      sprintf("%.3f", abs(estimate)),
+      " percentage points ",
+      if_else(estimate >= 0, "higher", "lower"),
+      " predicted quarterly company growth, ",
+      "holding the other predictors fixed."
+    )
+  )
+
+# Coefficients and approximate 95% confidence intervals
+board_results |>
+  select(predictor, estimate, lower, upper)
+
+# Statements your team lead can use
+cat(paste(board_results$statement, collapse = "\n\n"))
+```
+
+```{r}
+# Keep observations in chronological order
+evaluation_data <- data_all |> arrange(ds)
+
+# Start after 40 quarters of training data.
+# Stop where two future observations are still available.
+cutoffs <- seq(40, nrow(evaluation_data) - 2)
+
+forecast_errors <- map_dfr(cutoffs, function(i) {
+
+  # Only observations available at this historical cutoff
+  train <- evaluation_data[1:i, ]
+
+  # The next two quarters
+  test <- evaluation_data[(i + 1):(i + 2), ]
+
+  # Both functions forecast the economic predictors themselves
+  mlr_predictions <- forecast_growth(train, test)
+  sarima_predictions <- sarima_forecast(train, test)$out$Predicted
+
+  tibble(
+    cutoff = evaluation_data$ds[i],
+    horizon = 1:2,
+    actual = test$PctGrowth,
+    mlr_error = actual - as.numeric(mlr_predictions),
+    sarima_error = actual - as.numeric(sarima_predictions)
+  )
+})
+```
+
+```{r}
+# Compare average absolute errors
+forecast_errors |>
+  group_by(horizon) |>
+  summarise(
+    MLR_MAE = mean(abs(mlr_error)),
+    SARIMA_MAE = mean(abs(sarima_error)),
+    .groups = "drop"
+  )
+
+# One-quarter-ahead comparison
+errors_h1 <- forecast_errors |> filter(horizon == 1)
+
+dm.test(
+  errors_h1$mlr_error,
+  errors_h1$sarima_error,
+  alternative = "two.sided",
+  h = 1,
+  power = 1,
+  varestimator = "bartlett"
+)
+
+# Two-quarter-ahead comparison
+errors_h2 <- forecast_errors |> filter(horizon == 2)
+
+dm.test(
+  errors_h2$mlr_error,
+  errors_h2$sarima_error,
+  alternative = "two.sided",
+  h = 2,
+  power = 1,
+  varestimator = "bartlett"
+)
+```
+
+BOARD PRESENTATION NOTES: MODEL CHOICE
+
+Main message:
+We selected multiple linear regression (MLR) to explain how the four
+economic indicators relate to VistaLux's quarterly growth. It is the
+simpler of the two models and provides the clearest interpretation
+for the board.
+
+Evidence supporting the decision:
+Our historical forecasting comparisons did not find sufficient
+evidence that MLR and SARIMA differ in average absolute forecast
+error, either one quarter or two quarters ahead. The corresponding
+test p-values were approximately 0.113 and 0.222. MLR had slightly
+lower average absolute errors in these comparisons, but the
+differences were not statistically significant.
+
+This does not prove the models are equally accurate. It means these
+comparisons did not establish a clear forecasting advantage for
+either method. The tests provide supporting evidence rather than
+a guarantee about future performance.
+
+Why choose MLR?
+Without a demonstrated forecasting advantage from SARIMA's added
+complexity, we favor MLR's simpler structure. Its coefficients let
+us explain each economic indicator's relationship with company
+growth while holding the other indicators fixed.
+
+Suggested presenter wording:
+"We compared a straightforward regression model with a more complex
+time-series model. Our historical tests did not establish a clear
+difference in their forecasting accuracy over the next one or two
+quarters. We therefore selected the simpler regression model,
+which makes the economic relationships easier to explain and
+communicate to the board."
+
+How to present the four relationships:
+Use the MLR estimates and uncertainty intervals from board_results.
+Explain the direction and size of each association. Do not claim
+a clear positive or negative relationship when its interval includes
+zero. Check the residual diagnostics before relying on the ordinary
+MLR uncertainty intervals.
+
+Income refers to growth in consumers' disposable income, not
+VistaLux's own income. Describe the outcome as quarterly company
+growth. Describe relationships as associations, not proven causes.
+
+Scope:
+These forecasting comparisons concern one- and two-quarter horizons.
+They do not establish that MLR is best at every forecast horizon.
+Use observed results through 2025 Q2 and distinguish them from the
+forecasts for 2025 Q3 and Q4.
