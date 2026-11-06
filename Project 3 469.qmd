@@ -21,7 +21,7 @@ predictors <- c("Income", "Production", "Savings", "Unemployment")
 
 dir.create("figures", showWarnings = FALSE)
 
-data <- vroom("data/CompanyGrowth.csv") %>%
+data <- vroom("C:/Users/aidan/Downloads/CompanyGrowth.csv") %>%
   mutate(Qrtr = factor(Qrtr))
 
 data_all <- data %>%
@@ -371,15 +371,27 @@ board_results <- coefficient_table |>
     lower = estimate - 1.96 * se,
     upper = estimate + 1.96 * se,
 
-    statement = paste0(
-      "A one-unit increase in ",
-      variable_labels[predictor],
-      " is associated with ",
-      sprintf("%.3f", abs(estimate)),
-      " percentage points ",
-      if_else(estimate >= 0, "higher", "lower"),
-      " predicted quarterly company growth, ",
-      "holding the other predictors fixed."
+    statement = if_else(
+      lower <= 0 & upper >= 0,
+      
+      # What prints if the interval crosses zero (not significant)
+      paste0(
+        "Changes in ", 
+        variable_labels[predictor], 
+        " do not have a statistically significant relationship with quarterly company growth in this model, as the confidence interval includes zero."
+      ),
+      
+      # What prints if the interval does NOT cross zero (significant)
+      paste0(
+        "A one-unit increase in ",
+        variable_labels[predictor],
+        " is associated with ",
+        sprintf("%.3f", abs(estimate)),
+        " percentage points ",
+        if_else(estimate >= 0, "higher", "lower"),
+        " predicted quarterly company growth, ",
+        "holding the other predictors fixed."
+      )
     )
   )
 
@@ -387,11 +399,11 @@ board_results <- coefficient_table |>
 board_results |>
   select(predictor, estimate, lower, upper)
 
-# Statements your team lead can use
 cat(paste(board_results$statement, collapse = "\n\n"))
 ```
-
 ```{r}
+#| cache: true
+
 # Keep observations in chronological order
 evaluation_data <- data_all |> arrange(ds)
 
@@ -400,40 +412,44 @@ evaluation_data <- data_all |> arrange(ds)
 cutoffs <- seq(40, nrow(evaluation_data) - 2)
 
 forecast_errors <- map_dfr(cutoffs, function(i) {
-
+  
   # Only observations available at this historical cutoff
   train <- evaluation_data[1:i, ]
-
+  
   # The next two quarters
   test <- evaluation_data[(i + 1):(i + 2), ]
-
-  # Both functions forecast the economic predictors themselves
+  
+  # Forecast using all three methods
   mlr_predictions <- forecast_growth(train, test)
   sarima_predictions <- sarima_forecast(train, test)$out$Predicted
-
+  prophet_predictions <- prophet_forecast(train, test)$out$Predicted
+  
   tibble(
     cutoff = evaluation_data$ds[i],
     horizon = 1:2,
     actual = test$PctGrowth,
     mlr_error = actual - as.numeric(mlr_predictions),
-    sarima_error = actual - as.numeric(sarima_predictions)
+    sarima_error = actual - as.numeric(sarima_predictions),
+    prophet_error = actual - as.numeric(prophet_predictions)
   )
 })
 ```
 
 ```{r}
-# Compare average absolute errors
+# Compare average absolute errors for all three models
 forecast_errors |>
   group_by(horizon) |>
   summarise(
     MLR_MAE = mean(abs(mlr_error)),
     SARIMA_MAE = mean(abs(sarima_error)),
+    PROPHET_MAE = mean(abs(prophet_error)),
     .groups = "drop"
   )
 
-# One-quarter-ahead comparison
+# One-quarter-ahead comparisons
 errors_h1 <- forecast_errors |> filter(horizon == 1)
 
+# MLR vs SARIMA (h=1)
 dm.test(
   errors_h1$mlr_error,
   errors_h1$sarima_error,
@@ -443,9 +459,20 @@ dm.test(
   varestimator = "bartlett"
 )
 
-# Two-quarter-ahead comparison
+# MLR vs Prophet (h=1)
+dm.test(
+  errors_h1$mlr_error,
+  errors_h1$prophet_error,
+  alternative = "two.sided",
+  h = 1,
+  power = 1,
+  varestimator = "bartlett"
+)
+
+# Two-quarter-ahead comparisons
 errors_h2 <- forecast_errors |> filter(horizon == 2)
 
+# MLR vs SARIMA (h=2)
 dm.test(
   errors_h2$mlr_error,
   errors_h2$sarima_error,
@@ -454,56 +481,53 @@ dm.test(
   power = 1,
   varestimator = "bartlett"
 )
+
+# MLR vs Prophet (h=2)
+dm.test(
+  errors_h2$mlr_error,
+  errors_h2$prophet_error,
+  alternative = "two.sided",
+  h = 2,
+  power = 1,
+  varestimator = "bartlett"
+)
 ```
 
-BOARD PRESENTATION NOTES: MODEL CHOICE
+# PRESENTATION NOTES FOR MATTHEW
 
-Main message:
-We selected multiple linear regression (MLR) to explain how the four
-economic indicators relate to VistaLux's quarterly growth. It is the
-simpler of the two models and provides the clearest interpretation
-for the board.
+## Slide 1: Current Forecasting Strategy & 2025 Outlook
+**The Current Method:** 
+Our team currently relies on a Multiple Linear Regression (MLR) model to project VistaLux’s quarterly growth. This model operates by taking a "snapshot" of four major macroeconomic indicators—consumer disposable income, US production, personal savings, and unemployment—to estimate our company's growth in that exact same quarter. 
 
-Evidence supporting the decision:
-Our historical forecasting comparisons did not find sufficient
-evidence that MLR and SARIMA differ in average absolute forecast
-error, either one quarter or two quarters ahead. The corresponding
-test p-values were approximately 0.113 and 0.222. MLR had slightly
-lower average absolute errors in these comparisons, but the
-differences were not statistically significant.
+**2025 Forecasting Strategy:**
+Because 2025 hasn't happened yet, we do not have the actual economic indicator data needed to plug into the MLR model. To solve this, we used a two-stage forecasting method:
+1. First, we independently forecasted the four macroeconomic indicators for Q3 and Q4 of 2025. 
+2. Next, we fed those forecasted economic estimates into our MLR model to generate our final company growth projections.
 
-This does not prove the models are equally accurate. It means these
-comparisons did not establish a clear forecasting advantage for
-either method. The tests provide supporting evidence rather than
-a guarantee about future performance.
+**2025 Projections:**
+Using this method, our projected company growth is **0.768%** for Q3 2025 and **0.657%** for Q4 2025. 
 
-Why choose MLR?
-Without a demonstrated forecasting advantage from SARIMA's added
-complexity, we favor MLR's simpler structure. Its coefficients let
-us explain each economic indicator's relationship with company
-growth while holding the other indicators fixed.
+## Slide 2: Exploring Alternative Models
+To ensure we are using the most accurate forecasting methods, the data team explored two advanced alternatives to our current MLR model:
+1. **SARIMA (Seasonal Autoregressive Integrated Moving Average):** Unlike MLR, which only looks at a single quarter in isolation, SARIMA looks at the company's past growth momentum. It accounts for historical trends and repeating seasonal cycles (e.g., Q4 holiday spikes) while still factoring in the economic indicators.
+2. **Prophet:** Developed by Meta, this is a highly flexible additive model. It excels at adapting to shifting trendlines over time and handles missing data or outliers more smoothly than strict linear models, while still allowing us to add the four economic indicators as custom regressors.
 
-Suggested presenter wording:
-"We compared a straightforward regression model with a more complex
-time-series model. Our historical tests did not establish a clear
-difference in their forecasting accuracy over the next one or two
-quarters. We therefore selected the simpler regression model,
-which makes the economic relationships easier to explain and
-communicate to the board."
+## Slide 3: Model Performance & Recommendation
+**The Testing Method:**
+To determine which model performs best, we ran a "rolling origin" simulation. We stepped back through the company's history, hiding future data, and asked each model to predict the next one and two quarters. We then calculated the Mean Absolute Error (MAE) for all three models. 
 
-How to present the four relationships:
-Use the MLR estimates and uncertainty intervals from board_results.
-Explain the direction and size of each association. Do not claim
-a clear positive or negative relationship when its interval includes
-zero. Check the residual diagnostics before relying on the ordinary
-MLR uncertainty intervals.
+**The Verdict:**
+The current MLR model consistently produced the lowest average forecast error (0.439 at a 1-quarter horizon and 0.438 at a 2-quarter horizon). While SARIMA and Prophet are highly sophisticated, statistical tests (Diebold-Mariano) confirmed they did not provide a statistically significant improvement in forecasting accuracy over our current method. 
 
-Income refers to growth in consumers' disposable income, not
-VistaLux's own income. Describe the outcome as quarterly company
-growth. Describe relationships as associations, not proven causes.
+**Recommendation:** 
+Because the advanced models failed to demonstrate a clear predictive advantage, we recommend continuing with the MLR model. Its straightforward structure makes it much easier to explain exactly how the broader economy is impacting VistaLux's bottom line.
 
-Scope:
-These forecasting comparisons concern one- and two-quarter horizons.
-They do not establish that MLR is best at every forecast horizon.
-Use observed results through 2025 Q2 and distinguish them from the
-forecasts for 2025 Q3 and Q4.
+## Slide 4: Economic Relationships & Limitations
+Holding all other variables constant, our MLR model estimates the following relationships:
+* A one-unit increase in the disposable-income indicator is associated with a **0.741 percentage point increase** in quarterly growth.
+* A one-unit increase in the US production indicator is associated with a **0.047 percentage point increase** in quarterly growth.
+* A one-unit increase in the personal savings indicator is associated with a **0.053 percentage point decrease** in quarterly growth.
+* Changes in unemployment do not have a statistically significant relationship with our growth.
+
+**Statistical Limitations:**
+While these estimates provide a strong baseline, the board should view the exact confidence intervals with slight caution. Our residual diagnostic tests indicate that the MLR model errors are somewhat correlated over time and exhibit uneven variance, meaning the model's exact precision bounds may be overly optimistic.
