@@ -9,7 +9,12 @@ execute:
   message: false
 ---
 
+## Setup
+
 ```{r}
+#| message: false
+#| warning: false
+set.seed(469)
 library(vroom)
 library(tidyverse)
 library(forecast)
@@ -19,9 +24,7 @@ library(prophet)
 
 predictors <- c("Income", "Production", "Savings", "Unemployment")
 
-dir.create("figures", showWarnings = FALSE)
-
-data <- vroom("C:/Users/aidan/Downloads/CompanyGrowth.csv") %>%
+data <- vroom("C:/Users/aidan/Downloads/CompanyGrowth.csv", show_col_types = FALSE) %>%
   mutate(Qrtr = factor(Qrtr))
 
 data_all <- data %>%
@@ -35,6 +38,7 @@ tail(data_all)
 ```
 
 ```{r}
+# Quarters we need to project (2025 Q3 and Q4)
 make_future <- function(train, end_date = as.Date("2025-10-01")) {
   tibble(ds = seq(max(train$ds), end_date, by = "quarter")[-1]) %>%
     mutate(Year = year(ds),
@@ -42,492 +46,510 @@ make_future <- function(train, end_date = as.Date("2025-10-01")) {
 }
 
 future_all <- make_future(data_all)
-future_all   # CHECK: these are the quarters being projected
+future_all
+```
 
+## Helper functions
+
+```{r}
 ts_of <- function(x, df) ts(x, start = c(df$Year[1], df$q[1]), frequency = 4)
-mae   <- function(actual, pred) mean(abs(actual - pred))
-```
 
-```{r}
-forecast_growth <- function(train, test) {
-  X <- test
-  for (v in predictors) {
-    f <- as.formula(paste(v, "~ Year + Qrtr"))
-    X[[v]] <- predict(lm(f, data = train), newdata = test)
-  }
-  growth_fit <- lm(PctGrowth ~ Income + Production + Savings + Unemployment,
-                   data = train)
-  predict(growth_fit, newdata = X)
+metrics <- function(actual, pred) {
+  tibble(MAE  = mean(abs(actual - pred)),
+         RMSE = sqrt(mean((actual - pred)^2)))
 }
 
-holdout_results <- function(cut_year) {
-  tr <- data_all %>% filter(Year < cut_year)
-  te <- data_all %>% filter(Year >= cut_year)
-
-  known_fit <- lm(PctGrowth ~ Income + Production + Savings + Unemployment,
-                  data = tr)
-
-  tibble(
-    holdout         = paste0(cut_year, "-2024"),
-    n_quarters      = nrow(te),
-    mae_model       = mae(te$PctGrowth, forecast_growth(tr, te)),
-    mae_if_X_known  = mae(te$PctGrowth, predict(known_fit, newdata = te)),
-    mae_mean_only   = mae(te$PctGrowth, mean(tr$PctGrowth))
-  )
+# ---- Stage 1: three ways to forecast the four economic indicators ----
+forecast_X_lm <- function(train, future) {
+  X <- sapply(predictors, function(v)
+    predict(lm(as.formula(paste(v, "~ Year + Qrtr")), data = train), newdata = future))
+  matrix(X, nrow = nrow(future), dimnames = list(NULL, predictors))
 }
 
-bind_rows(holdout_results(2024), holdout_results(2020)) %>%
-  mutate(across(starts_with("mae"), ~ round(.x, 3)))
-```
-
-```{r}
-current_model <- lm(PctGrowth ~ Income + Production + Savings + Unemployment,
-                    data = data_all)
-summary(current_model)
-```
-
-```{r}
-data_all <- data_all %>%
-  mutate(fitted_vals = fitted(current_model),
-         resids = residuals(current_model),
-         time = Year + (as.numeric(as.character(Qrtr)) - 1) / 4)
-
-title_theme <- theme(plot.title = element_text(size = 10))
-
-p_acf <- forecast::ggAcf(data_all$resids) +
-  labs(title = "ACF of MLR Residuals") + title_theme
-
-p_res <- ggplot(data_all, aes(x = fitted_vals, y = resids)) +
-  geom_point() +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
-  labs(title = "Residuals vs Fitted", x = "Fitted Values", y = "Residuals") +
-  title_theme
-
-p_hist <- ggplot(data_all, aes(x = resids)) +
-  geom_histogram(bins = 15, fill = "darkgray", color = "black") +
-  labs(title = "Histogram", x = "Residuals", y = "Count") + title_theme
-
-p_qq <- ggplot(data_all, aes(sample = resids)) +
-  stat_qq() + stat_qq_line(color = "red") +
-  labs(title = "Normal QQ Plot", x = "Theoretical", y = "Sample") + title_theme
-
-p_time <- ggplot(data_all, aes(x = time, y = resids)) +
-  geom_point() +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
-  labs(title = "Residuals Over Time", x = "Year", y = "Residuals") + title_theme
-
-(p_acf | p_res | p_hist) / (p_qq | p_time)
-
-print(shapiro.test(data_all$resids))
-print(bptest(current_model))
-print(dwtest(current_model))
-print(Box.test(data_all$resids, lag = 8, type = "Ljung-Box"))
-```
-
-```{r}
-lm_income     <- lm(Income ~ Year + Qrtr,       data = data_all)
-lm_production <- lm(Production ~ Year + Qrtr,   data = data_all)
-lm_savings    <- lm(Savings ~ Year + Qrtr,      data = data_all)
-lm_unemp      <- lm(Unemployment ~ Year + Qrtr, data = data_all)
-
-# Predict using future_all (which holds only Q3 and Q4)
-data_2025 <- future_all %>%
-  mutate(
-    Income       = predict(lm_income, newdata = future_all),
-    Production   = predict(lm_production, newdata = future_all),
-    Savings      = predict(lm_savings, newdata = future_all),
-    Unemployment = predict(lm_unemp, newdata = future_all)
-  )
-
-predictions_2025 <- predict(current_model, newdata = data_2025,
-                            interval = "prediction")
-
-data_2025 <- data_2025 %>%
-  mutate(Predicted_PctGrowth = predictions_2025[, "fit"],
-         Lower_PI_old = predictions_2025[, "lwr"],
-         Upper_PI_old = predictions_2025[, "upr"])
-
-# Simulation interval that includes uncertainty in the forecasted predictors
-pred_models <- list(Income = lm_income, Production = lm_production,
-                    Savings = lm_savings, Unemployment = lm_unemp)
-pred_resids <- sapply(pred_models, residuals)
-beta <- coef(current_model)
-growth_resids <- residuals(current_model)
-
-set.seed(469)
-B <- 5000
-
-# Dynamically map over the remaining future quarters
-quarters_to_predict <- as.numeric(as.character(data_2025$Qrtr))
-
-sim_summary <- map_dfr(1:nrow(data_2025), function(i) {
-  q_val <- quarters_to_predict[i]
-  idx <- sample(nrow(pred_resids), B, replace = TRUE)
-  base <- unlist(data_2025[i, predictors])
-  
-  Xq <- sweep(pred_resids[idx, predictors], 2, base, "+")
-  sims <- as.vector(cbind(1, Xq) %*% beta) +
-    sample(growth_resids, B, replace = TRUE)
-  
-  tibble(Qrtr = q_val,
-         Lower_PI_sim = quantile(sims, 0.025),
-         Upper_PI_sim = quantile(sims, 0.975))
-}) %>% mutate(Qrtr = factor(Qrtr, levels = levels(data_all$Qrtr)))
-
-data_2025 <- left_join(data_2025, sim_summary, by = "Qrtr")
-print(data_2025 %>%
-        select(Year, Qrtr, Predicted_PctGrowth, starts_with("Lower"),
-               starts_with("Upper")))
-```
-
-```{r}
-#sarima
-
-sarima_forecast_X <- function(train, h) {
-  X <- sapply(predictors, function(v) {
-    as.numeric(forecast(auto.arima(ts_of(train[[v]], train), seasonal = TRUE), h = h)$mean)
-  })
+forecast_X_arima <- function(train, future) {
+  h <- nrow(future)
+  X <- sapply(predictors, function(v)
+    as.numeric(forecast(auto.arima(ts_of(train[[v]], train), seasonal = TRUE), h = h)$mean))
   matrix(X, nrow = h, dimnames = list(NULL, predictors))
 }
 
-sarima_forecast <- function(train, future) {
-  h        <- nrow(future)
-  X_future <- sarima_forecast_X(train, h)
-  fit <- auto.arima(ts_of(train$PctGrowth, train),
-                    xreg = as.matrix(train[, predictors]), seasonal = TRUE)
-  fc <- forecast(fit, xreg = X_future, h = h, level = 95)
-
-  list(fit = fit, X_future = X_future,
-       out = tibble(Year = future$Year, Qrtr = future$Qrtr, Model = "SARIMA + xreg",
-                    Predicted = as.numeric(fc$mean),
-                    Lower_95  = as.numeric(fc$lower), Upper_95  = as.numeric(fc$upper)))
-}
-```
-
-```{r}
 fit_prophet <- function(df, regressors = NULL) {
+  # yearly.seasonality = 1: quarterly data only supports a low-order seasonal term
   m <- prophet(weekly.seasonality = FALSE, daily.seasonality = FALSE,
-               yearly.seasonality = 2, interval.width = 0.95, fit = FALSE)
+               yearly.seasonality = 1, interval.width = 0.95, fit = FALSE)
   for (r in regressors) m <- add_regressor(m, r)
   suppressMessages(fit.prophet(m, df))
 }
 
-prophet_forecast_X <- function(train, future) {
-  out <- map(predictors, function(v) {
+forecast_X_prophet <- function(train, future) {
+  X <- sapply(predictors, function(v) {
     m <- fit_prophet(train %>% transmute(ds, y = .data[[v]]))
-    predict(m, future %>% select(ds))$yhat
+    predict(m, future %>% dplyr::select(ds))$yhat
   })
-  names(out) <- predictors
-  as_tibble(out)
+  matrix(X, nrow = nrow(future), dimnames = list(NULL, predictors))
 }
 
-prophet_forecast <- function(train, future, seed = 469) {
-  set.seed(seed)
-  X_future <- prophet_forecast_X(train, future)
-  m <- fit_prophet(train %>% select(ds, y, all_of(predictors)), regressors = predictors)
-  pred <- predict(m, bind_cols(future %>% select(ds), X_future))
+# ---- Stage 2: growth models (all use all four predictors) ----
+growth_models <- c("MLR", "SARIMA (auto)", "SARIMA (d=0)", "Prophet")
 
-  list(model = m, X_future = X_future,
-       out = tibble(Year = future$Year, Qrtr = future$Qrtr, Model = "Prophet + regressors",
-                    Predicted = pred$yhat,
-                    Lower_95  = pred$yhat_lower, Upper_95  = pred$yhat_upper))
+fit_growth <- function(train, model) {
+  y_ts <- ts_of(train$PctGrowth, train)
+  X_tr <- as.matrix(train[, predictors])
+  switch(model,
+    "MLR"           = lm(PctGrowth ~ Income + Production + Savings + Unemployment, data = train),
+    "SARIMA (auto)" = auto.arima(y_ts, xreg = X_tr, seasonal = TRUE),
+    "SARIMA (d=0)"  = auto.arima(y_ts, xreg = X_tr, seasonal = TRUE, d = 0),
+    "Prophet"       = fit_prophet(train %>% dplyr::select(ds, y, all_of(predictors)),
+                                  regressors = predictors))
+}
+
+predict_growth <- function(fit, future, X) {
+  if (inherits(fit, "lm")) {
+    p <- predict(fit, newdata = as.data.frame(X), interval = "prediction", level = 0.95)
+    tibble(Predicted = p[, "fit"], Lower_95 = p[, "lwr"], Upper_95 = p[, "upr"])
+  } else if (inherits(fit, "Arima")) {
+    fc <- forecast(fit, xreg = X, level = 95)
+    tibble(Predicted = as.numeric(fc$mean),
+           Lower_95  = as.numeric(fc$lower),
+           Upper_95  = as.numeric(fc$upper))
+  } else {
+    p <- predict(fit, bind_cols(future %>% dplyr::select(ds), as_tibble(X)))
+    tibble(Predicted = p$yhat, Lower_95 = p$yhat_lower, Upper_95 = p$yhat_upper)
+  }
+}
+
+# Which indicator forecast each full pipeline uses for real 2025 projections
+own_pipeline <- tribble(
+  ~model,          ~X_source,
+  "MLR",           "Forecast X: lm trend",
+  "SARIMA (auto)", "Forecast X: ARIMA",
+  "SARIMA (d=0)",  "Forecast X: ARIMA",
+  "Prophet",       "Forecast X: Prophet"
+)
+```
+
+## Current model: MLR
+
+```{r}
+current_model <- lm(PctGrowth ~ Income + Production + Savings + Unemployment, data = data_all)
+summary(current_model)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+data_all <- data_all %>%
+  mutate(fitted_vals = fitted(current_model),
+         resids      = residuals(current_model),
+         time        = Year + (q - 1) / 4)
+
+title_theme <- theme(plot.title = element_text(size = 10))
+
+p_acf  <- ggAcf(data_all$resids) + labs(title = "ACF of MLR Residuals") + title_theme
+p_res  <- ggplot(data_all, aes(fitted_vals, resids)) + geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals vs Fitted", x = "Fitted Values", y = "Residuals") + title_theme
+p_hist <- ggplot(data_all, aes(resids)) +
+  geom_histogram(bins = 15, fill = "darkgray", color = "black") +
+  labs(title = "Histogram", x = "Residuals", y = "Count") + title_theme
+p_qq   <- ggplot(data_all, aes(sample = resids)) + stat_qq() + stat_qq_line(color = "red") +
+  labs(title = "Normal QQ Plot", x = "Theoretical", y = "Sample") + title_theme
+p_time <- ggplot(data_all, aes(time, resids)) + geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals Over Time", x = "Year", y = "Residuals") + title_theme
+
+(p_acf | p_res | p_hist) / (p_qq | p_time)
+```
+
+```{r}
+shapiro.test(data_all$resids)
+bptest(current_model)
+dwtest(current_model)
+Box.test(data_all$resids, lag = 8, type = "Ljung-Box")
+```
+
+## Holdout test: train through 2024 Q2, test 2024 Q3 – 2025 Q2
+
+```{r}
+#| message: false
+#| warning: false
+run_holdout <- function(cut_date) {
+  tr <- data_all %>% filter(ds <  cut_date)
+  te <- data_all %>% filter(ds >= cut_date)
+  label <- paste(format(cut_date), "to 2025 Q2")
+
+  X_sets <- list(
+    "Actual X"             = as.matrix(te[, predictors]),
+    "Forecast X: lm trend" = forecast_X_lm(tr, te),
+    "Forecast X: ARIMA"    = forecast_X_arima(tr, te),
+    "Forecast X: Prophet"  = forecast_X_prophet(tr, te)
+  )
+
+  fits <- set_names(map(growth_models, ~ fit_growth(tr, .x)), growth_models)
+
+  res <- imap_dfr(fits, function(fit, m) imap_dfr(X_sets, function(X, xs) {
+    pred <- predict_growth(fit, te, X)$Predicted
+    bind_cols(tibble(test_set = label, n_test = nrow(te), model = m, X_source = xs),
+              metrics(te$PctGrowth, pred))
+  }))
+
+  base <- bind_cols(tibble(test_set = label, n_test = nrow(te), model = "Mean only", X_source = "-"),
+                    metrics(te$PctGrowth, mean(tr$PctGrowth)))
+
+  list(results = bind_rows(res, base), fits = fits, X_sets = X_sets, test = te)
+}
+
+hold4 <- run_holdout(as.Date("2024-07-01"))
+
+# Which SARIMA orders were chosen on the training data
+hold4$fits[["SARIMA (auto)"]]
+hold4$fits[["SARIMA (d=0)"]]
+```
+
+```{r}
+# (A) Model quality: actual indicator values plugged in for the test quarters
+hold4$results %>%
+  filter(X_source %in% c("Actual X", "-")) %>%
+  mutate(across(c(MAE, RMSE), ~ round(.x, 3))) %>%
+  arrange(RMSE)
+```
+
+```{r}
+# (B) Realistic accuracy: each model with its own forecasted indicators
+hold4$results %>%
+  semi_join(own_pipeline, by = c("model", "X_source")) %>%
+  bind_rows(hold4$results %>% filter(model == "Mean only")) %>%
+  mutate(across(c(MAE, RMSE), ~ round(.x, 3))) %>%
+  arrange(RMSE)
+```
+
+```{r}
+# (C) Full grid of RMSE: rows = growth model, columns = source of indicator values
+hold4$results %>%
+  filter(model != "Mean only") %>%
+  dplyr::select(model, X_source, RMSE) %>%
+  mutate(RMSE = round(RMSE, 3)) %>%
+  pivot_wider(names_from = X_source, values_from = RMSE)
+```
+
+```{r}
+# Quarter-by-quarter holdout predictions (actual indicators) vs actual growth
+holdout_preds <- imap_dfr(hold4$fits, function(fit, m)
+  tibble(ds = hold4$test$ds, model = m,
+         Predicted = predict_growth(fit, hold4$test, hold4$X_sets[["Actual X"]])$Predicted))
+
+holdout_preds %>%
+  mutate(Predicted = round(Predicted, 3)) %>%
+  pivot_wider(names_from = model, values_from = Predicted) %>%
+  left_join(hold4$test %>% dplyr::select(ds, Actual = PctGrowth), by = "ds")
+```
+
+```{r}
+#| fig-width: 9
+#| fig-height: 4.5
+ggplot() +
+  geom_line(data = data_all %>% filter(ds >= as.Date("2021-01-01")),
+            aes(ds, PctGrowth), color = "black") +
+  geom_point(data = hold4$test, aes(ds, PctGrowth), color = "black", size = 2) +
+  geom_line(data = holdout_preds, aes(ds, Predicted, color = model), linewidth = 1) +
+  geom_point(data = holdout_preds, aes(ds, Predicted, color = model), size = 2) +
+  geom_vline(xintercept = as.Date("2024-07-01"), linetype = "dashed", color = "gray50") +
+  labs(title = "Holdout: predicted vs actual growth (2024 Q3 - 2025 Q2)",
+       subtitle = "Black = actual; models trained through 2024 Q2 using actual indicator values",
+       x = NULL, y = "PctGrowth", color = "Model") +
+  theme_minimal()
+```
+
+```{r}
+#| message: false
+#| warning: false
+# Sensitivity check: last 3 quarters only (2024 Q4 - 2025 Q2)
+hold3 <- run_holdout(as.Date("2024-10-01"))
+
+hold3$results %>%
+  filter(X_source %in% c("Actual X", "-")) %>%
+  mutate(across(c(MAE, RMSE), ~ round(.x, 3))) %>%
+  arrange(RMSE)
+```
+
+## 2025 projections (all models fit on data through 2025 Q2)
+
+```{r}
+#| message: false
+#| warning: false
+final_fits <- set_names(map(growth_models, ~ fit_growth(data_all, .x)), growth_models)
+
+X_future <- list(
+  "Forecast X: lm trend" = forecast_X_lm(data_all, future_all),
+  "Forecast X: ARIMA"    = forecast_X_arima(data_all, future_all),
+  "Forecast X: Prophet"  = forecast_X_prophet(data_all, future_all)
+)
+
+# Forecasted indicator values used for 2025 Q3 and Q4 (useful for a slide)
+imap_dfr(X_future, ~ as_tibble(.x) %>%
+           mutate(X_source = .y, Qrtr = future_all$Qrtr, .before = 1)) %>%
+  mutate(across(all_of(predictors), ~ round(.x, 3)))
+
+# Final SARIMA model (fit on all data through 2025 Q2)
+final_fits[["SARIMA (d=0)"]]
+```
+
+```{r}
+proj_2025 <- pmap_dfr(own_pipeline, function(model, X_source)
+  bind_cols(future_all %>% dplyr::select(Year, Qrtr),
+            tibble(Model = model),
+            predict_growth(final_fits[[model]], future_all, X_future[[X_source]])))
+
+proj_2025 %>% mutate(across(c(Predicted, Lower_95, Upper_95), ~ round(.x, 3)))
+```
+
+```{r}
+# MLR simulation interval: also includes uncertainty in the forecasted indicators
+set.seed(469)
+B <- 5000
+
+pred_resids <- sapply(predictors, function(v)
+  residuals(lm(as.formula(paste(v, "~ Year + Qrtr")), data = data_all)))
+beta          <- coef(final_fits$MLR)
+growth_resids <- residuals(final_fits$MLR)
+X_lm_future   <- X_future[["Forecast X: lm trend"]]
+
+mlr_sim <- map_dfr(seq_len(nrow(future_all)), function(i) {
+  idx  <- sample(nrow(pred_resids), B, replace = TRUE)
+  Xq   <- sweep(pred_resids[idx, predictors], 2, X_lm_future[i, predictors], "+")
+  sims <- as.numeric(cbind(1, Xq) %*% beta) + sample(growth_resids, B, replace = TRUE)
+  tibble(Year = future_all$Year[i], Qrtr = future_all$Qrtr[i],
+         Lower_95_sim = unname(quantile(sims, 0.025)),
+         Upper_95_sim = unname(quantile(sims, 0.975)))
+})
+
+proj_2025 %>%
+  filter(Model == "MLR") %>%
+  left_join(mlr_sim, by = c("Year", "Qrtr")) %>%
+  mutate(across(where(is.numeric) & !Year, ~ round(.x, 3)))
+```
+
+## Residual diagnostics for the alternatives
+
+```{r}
+checkresiduals(final_fits[["SARIMA (auto)"]])
+checkresiduals(final_fits[["SARIMA (d=0)"]])
+```
+
+```{r}
+for (m in c("SARIMA (auto)", "SARIMA (d=0)")) {
+  r <- as.numeric(residuals(final_fits[[m]]))
+  cat("\n=====", m, "=====\n")
+  print(shapiro.test(r))
+  print(Box.test(r, lag = 8, type = "Ljung-Box"))
 }
 ```
 
 ```{r}
-holdout_sarima_prophet <- function(cut_year) {
-  tr <- data_all %>% filter(Year <  cut_year)
-  te <- data_all %>% filter(Year >= cut_year)
+prophet_resids <- data_all$y -
+  predict(final_fits$Prophet, data_all %>% dplyr::select(ds, all_of(predictors)))$yhat
 
-  sar <- sarima_forecast(tr, te)$out$Predicted
-  pro <- prophet_forecast(tr, te)$out$Predicted
-
-  tibble(holdout = paste0(cut_year, "-", max(te$Year)),
-         n_quarters = nrow(te),
-         mae_sarima  = mae(te$PctGrowth, sar),
-         mae_prophet = mae(te$PctGrowth, pro))
-}
-
-comparison_new <- bind_rows(holdout_sarima_prophet(2024), holdout_sarima_prophet(2020)) %>%
-  mutate(across(starts_with("mae"), ~ round(.x, 3)))
-comparison_new
-```
-
-```{r}
-sarima_final  <- sarima_forecast(data_all, future_all)
-prophet_final <- prophet_forecast(data_all, future_all)
-
-proj_new <- bind_rows(sarima_final$out, prophet_final$out) %>%
-  mutate(across(c(Predicted, Lower_95, Upper_95), ~ round(.x, 2)))
-proj_new
-
-# Forecasted variable values each model used in stage 2 (useful for a slide)
-sarima_final$X_future
-prophet_final$X_future
-```
-
-```{r}
-checkresiduals(sarima_final$fit)
-sarima_resids <- as.numeric(residuals(sarima_final$fit))
-shapiro.test(sarima_resids)
-Box.test(sarima_resids, lag = 8, type = "Ljung-Box")
-
-prophet_resids <- data_all$y - predict(prophet_final$model,
-                                       data_all %>% select(ds, all_of(predictors)))$yhat
-forecast::ggAcf(prophet_resids) + labs(title = "ACF of Prophet Residuals")
+ggAcf(prophet_resids) + labs(title = "ACF of Prophet Residuals")
 shapiro.test(prophet_resids)
 Box.test(prophet_resids, lag = 8, type = "Ljung-Box")
 ```
 
+## How the indicators relate to growth
+
 ```{r}
-# Extract the four predictor coefficients and their standard errors
+# Pick the SARIMA version that did better in the holdout
+sarima_choice <- "SARIMA (d=0)"   # or "SARIMA (auto)"
+sar_fit <- final_fits[[sarima_choice]]
+
 coefficient_table <- bind_rows(
-  tibble(
-    predictor = predictors,
-    model = "MLR",
-    estimate = as.numeric(coef(current_model)[predictors]),
-    se = sqrt(diag(vcov(current_model)))[predictors]
-  ),
-  tibble(
-    predictor = predictors,
-    model = "SARIMA",
-    estimate = as.numeric(coef(sarima_final$fit)[predictors]),
-    se = sqrt(diag(sarima_final$fit$var.coef))[predictors]
-  )
+  tibble(predictor = predictors, model = "MLR",
+         estimate  = unname(coef(final_fits$MLR)[predictors]),
+         se        = unname(sqrt(diag(vcov(final_fits$MLR)))[predictors])),
+  tibble(predictor = predictors, model = sarima_choice,
+         estimate  = unname(coef(sar_fit)[predictors]),
+         se        = unname(sqrt(diag(sar_fit$var.coef))[predictors])),
+  prophet::regressor_coefficients(final_fits$Prophet) %>%
+    transmute(predictor = regressor, model = "Prophet", estimate = coef, se = NA_real_)
 )
 
-# Vary each predictor over its observed range
+coefficient_table %>% mutate(across(c(estimate, se), ~ round(.x, 4)))
+```
+
+```{r}
+#| fig-width: 9
+#| fig-height: 6
+#| warning: false
 relationship_data <- map_dfr(predictors, function(variable) {
-
-  values <- seq(
-    min(data_all[[variable]]),
-    max(data_all[[variable]]),
-    length.out = 100
-  )
-
+  values    <- seq(min(data_all[[variable]]), max(data_all[[variable]]), length.out = 100)
   reference <- median(data_all[[variable]])
-
-  crossing(
-    coefficient_table |> filter(predictor == variable),
-    value = values
-  ) |>
-    mutate(
-      change = estimate * (value - reference),
-
-      # Approximate 95% confidence intervals for the change
-      margin = 1.96 * se * abs(value - reference),
-      lower = change - margin,
-      upper = change + margin
-    )
+    crossing(coefficient_table %>% filter(predictor == variable, model != "Prophet"), value = values) %>%
+    mutate(change = estimate * (value - reference),
+           margin = 1.96 * se * abs(value - reference),
+           lower  = change - margin,
+           upper  = change + margin)
 })
 
-# Plot the four relationships for both models
-ggplot(
-  relationship_data,
-  aes(x = value, y = change, color = model, fill = model)
-) +
-  geom_hline(
-    yintercept = 0,
-    linetype = "dashed",
-    color = "gray60"
-  ) +
-  geom_ribbon(
-    aes(ymin = lower, ymax = upper),
-    alpha = 0.15,
-    color = NA
-  ) +
-  geom_line(aes(linewidth = model)) +
-    scale_linewidth_manual(
-    values = c("MLR" = 1.5, "SARIMA" = 1),
-    guide = "none"
-  ) +
+ggplot(relationship_data, aes(value, change, color = model, fill = model)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, color = NA, na.rm = TRUE) +
+  geom_line(linewidth = 1) +
   facet_wrap(~ predictor, scales = "free_x") +
-  labs(
-    title = "Predictor Relationships with Company Growth",
-    subtitle = "Change relative to each predictor's median",
-    x = "Predictor value (original units)",
-    y = "Predicted change in PctGrowth",
-    color = "Model",
-    fill = "Model"
-  ) +
+  labs(title = "Predictor Relationships with Company Growth",
+       subtitle = "Change relative to each predictor's median (bands = approx. 95% CI where available)",
+       x = "Predictor value (original units)", y = "Predicted change in PctGrowth",
+       color = "Model", fill = "Model") +
   theme_minimal()
 ```
 
- 
-# Choose the model you want to present: "SARIMA" or "MLR"
 ```{r}
-preferred_model <- "MLR"
+# Choose the model you will present: "MLR", sarima_choice, or "Prophet"
+preferred_model <- "SARIMA (d=0)"
 
 variable_labels <- c(
-  Income = "the disposable-income growth indicator",
-  Production = "the US production growth indicator",
-  Savings = "the personal savings change indicator",
+  Income       = "the disposable-income growth indicator",
+  Production   = "the US production growth indicator",
+  Savings      = "the personal savings change indicator",
   Unemployment = "the unemployment-rate change indicator"
 )
 
-board_results <- coefficient_table |>
-  filter(model == preferred_model) |>
+board_results <- coefficient_table %>%
+  filter(model == preferred_model) %>%
   mutate(
     lower = estimate - 1.96 * se,
     upper = estimate + 1.96 * se,
-
-    statement = if_else(
-      lower <= 0 & upper >= 0,
-      
-      # What prints if the interval crosses zero (not significant)
-      paste0(
-        "Changes in ", 
-        variable_labels[predictor], 
-        " do not have a statistically significant relationship with quarterly company growth in this model, as the confidence interval includes zero."
-      ),
-      
-      # What prints if the interval does NOT cross zero (significant)
-      paste0(
-        "A one-unit increase in ",
-        variable_labels[predictor],
-        " is associated with ",
-        sprintf("%.3f", abs(estimate)),
-        " percentage points ",
-        if_else(estimate >= 0, "higher", "lower"),
-        " predicted quarterly company growth, ",
-        "holding the other predictors fixed."
-      )
+    significant = !is.na(se) & (lower > 0 | upper < 0),
+    effect = paste0("A one-unit increase in ", variable_labels[predictor],
+                    " is associated with ", sprintf("%.3f", abs(estimate)),
+                    " percentage points ", if_else(estimate >= 0, "higher", "lower"),
+                    " predicted quarterly company growth, holding the other predictors fixed"),
+    statement = case_when(
+      is.na(se)    ~ paste0(effect, " (this model does not report a standard error)."),
+      !significant ~ paste0("Changes in ", variable_labels[predictor],
+                            " do not have a statistically significant relationship with ",
+                            "quarterly company growth in this model, as the confidence interval includes zero."),
+      TRUE         ~ paste0(effect, ".")
     )
   )
 
-# Coefficients and approximate 95% confidence intervals
-board_results |>
-  select(predictor, estimate, lower, upper)
-
+board_results %>% dplyr::select(predictor, estimate, lower, upper)
 cat(paste(board_results$statement, collapse = "\n\n"))
 ```
-```{r}
-#| cache: true
-
-# Keep observations in chronological order
-evaluation_data <- data_all |> arrange(ds)
-
-# Start after 40 quarters of training data.
-# Stop where two future observations are still available.
-cutoffs <- seq(40, nrow(evaluation_data) - 2)
-
-forecast_errors <- map_dfr(cutoffs, function(i) {
-  
-  # Only observations available at this historical cutoff
-  train <- evaluation_data[1:i, ]
-  
-  # The next two quarters
-  test <- evaluation_data[(i + 1):(i + 2), ]
-  
-  # Forecast using all three methods
-  mlr_predictions <- forecast_growth(train, test)
-  sarima_predictions <- sarima_forecast(train, test)$out$Predicted
-  prophet_predictions <- prophet_forecast(train, test)$out$Predicted
-  
-  tibble(
-    cutoff = evaluation_data$ds[i],
-    horizon = 1:2,
-    actual = test$PctGrowth,
-    mlr_error = actual - as.numeric(mlr_predictions),
-    sarima_error = actual - as.numeric(sarima_predictions),
-    prophet_error = actual - as.numeric(prophet_predictions)
-  )
-})
-```
-
-```{r}
-# Compare average absolute errors for all three models
-forecast_errors |>
-  group_by(horizon) |>
-  summarise(
-    MLR_MAE = mean(abs(mlr_error)),
-    SARIMA_MAE = mean(abs(sarima_error)),
-    PROPHET_MAE = mean(abs(prophet_error)),
-    .groups = "drop"
-  )
-
-# One-quarter-ahead comparisons
-errors_h1 <- forecast_errors |> filter(horizon == 1)
-
-# MLR vs SARIMA (h=1)
-dm.test(
-  errors_h1$mlr_error,
-  errors_h1$sarima_error,
-  alternative = "two.sided",
-  h = 1,
-  power = 1,
-  varestimator = "bartlett"
-)
-
-# MLR vs Prophet (h=1)
-dm.test(
-  errors_h1$mlr_error,
-  errors_h1$prophet_error,
-  alternative = "two.sided",
-  h = 1,
-  power = 1,
-  varestimator = "bartlett"
-)
-
-# Two-quarter-ahead comparisons
-errors_h2 <- forecast_errors |> filter(horizon == 2)
-
-# MLR vs SARIMA (h=2)
-dm.test(
-  errors_h2$mlr_error,
-  errors_h2$sarima_error,
-  alternative = "two.sided",
-  h = 2,
-  power = 1,
-  varestimator = "bartlett"
-)
-
-# MLR vs Prophet (h=2)
-dm.test(
-  errors_h2$mlr_error,
-  errors_h2$prophet_error,
-  alternative = "two.sided",
-  h = 2,
-  power = 1,
-  varestimator = "bartlett"
-)
-```
-
 # PRESENTATION NOTES FOR MATTHEW
 
-## Slide 1: Current Forecasting Strategy & 2025 Outlook
-**The Current Method:** 
-Our team currently relies on a Multiple Linear Regression (MLR) model to project VistaLux’s quarterly growth. This model operates by taking a "snapshot" of four major macroeconomic indicators—consumer disposable income, US production, personal savings, and unemployment—to estimate our company's growth in that exact same quarter. 
+## Slide 1: Current Model (MLR) and 2025 Outlook
 
-**2025 Forecasting Strategy:**
-Because 2025 hasn't happened yet, we do not have the actual economic indicator data needed to plug into the MLR model. To solve this, we used a two-stage forecasting method:
-1. First, we independently forecasted the four macroeconomic indicators for Q3 and Q4 of 2025. 
-2. Next, we fed those forecasted economic estimates into our MLR model to generate our final company growth projections.
+**The current method:** We currently use a multiple linear regression (MLR) that predicts each quarter's growth from four economic indicators measured in that same quarter: disposable-income growth, US production growth, personal savings changes, and unemployment-rate changes. It treats every quarter as independent of the ones before it. It explains about 77% of the quarter-to-quarter variation in growth (R² = 0.768).
 
-**2025 Projections:**
-Using this method, our projected company growth is **0.768%** for Q3 2025 and **0.657%** for Q4 2025. 
+**How it performs:** We trained the model on data through 2024 Q2 and had it predict the four quarters we hid (2024 Q3 – 2025 Q2).
 
-## Slide 2: Exploring Alternative Models
-To ensure we are using the most accurate forecasting methods, the data team explored two advanced alternatives to our current MLR model:
-1. **SARIMA (Seasonal Autoregressive Integrated Moving Average):** Unlike MLR, which only looks at a single quarter in isolation, SARIMA looks at the company's past growth momentum. It accounts for historical trends and repeating seasonal cycles (e.g., Q4 holiday spikes) while still factoring in the economic indicators.
-2. **Prophet:** Developed by Meta, this is a highly flexible additive model. It excels at adapting to shifting trendlines over time and handles missing data or outliers more smoothly than strict linear models, while still allowing us to add the four economic indicators as custom regressors.
+- Given the actual indicator values for those quarters, its typical error (RMSE) was **0.194 percentage points**.
+- When it also had to forecast the indicators, as it must for 2025, the error grew to **0.319**.
+- For comparison, simply predicting the historical average every quarter gives an error of 0.358.
 
-## Slide 3: Model Performance & Recommendation
-**The Testing Method:**
-To determine which model performs best, we ran a "rolling origin" simulation. We stepped back through the company's history, hiding future data, and asked each model to predict the next one and two quarters. We then calculated the Mean Absolute Error (MAE) for all three models. 
+**How we got the 2025 projections:** The model needs indicator values for Q3 and Q4 2025, which don't exist yet, so we used two stages:
 
-**The Verdict:**
-The current MLR model consistently produced the lowest average forecast error (0.439 at a 1-quarter horizon and 0.438 at a 2-quarter horizon). While SARIMA and Prophet are highly sophisticated, statistical tests (Diebold-Mariano) confirmed they did not provide a statistically significant improvement in forecasting accuracy over our current method. 
+1. Forecast each indicator for Q3 and Q4 2025 from its long-run trend and typical quarterly pattern (a regression of each indicator on year and quarter).
+2. Plug those forecasted indicators into the MLR to get projected growth.
 
-**Recommendation:** 
-Because the advanced models failed to demonstrate a clear predictive advantage, we recommend continuing with the MLR model. Its straightforward structure makes it much easier to explain exactly how the broader economy is impacting VistaLux's bottom line.
+| Quarter | Projected growth | 95% prediction interval | Interval including indicator uncertainty |
+|---|---|---|---|
+| Q3 2025 | 0.768% | 0.15% to 1.38% | −0.78% to 1.94% |
+| Q4 2025 | 0.657% | 0.04% to 1.27% | −0.84% to 1.77% |
 
-## Slide 4: Economic Relationships & Limitations
-Holding all other variables constant, our MLR model estimates the following relationships:
-* A one-unit increase in the disposable-income indicator is associated with a **0.741 percentage point increase** in quarterly growth.
-* A one-unit increase in the US production indicator is associated with a **0.047 percentage point increase** in quarterly growth.
-* A one-unit increase in the personal savings indicator is associated with a **0.053 percentage point decrease** in quarterly growth.
-* Changes in unemployment do not have a statistically significant relationship with our growth.
+The last column comes from a simulation that also accounts for the chance that our indicator forecasts are wrong. It is the more realistic range.
 
-**Statistical Limitations:**
-While these estimates provide a strong baseline, the board should view the exact confidence intervals with slight caution. Our residual diagnostic tests indicate that the MLR model errors are somewhat correlated over time and exhibit uneven variance, meaning the model's exact precision bounds may be overly optimistic.
+**Concerns with the current model:**
+
+- Its errors are correlated from one quarter to the next (Ljung-Box p = 0.029), which breaks its independence assumption.
+- Its errors are not normally distributed (Shapiro-Wilk p < 0.001).
+- Their spread is uneven (Breusch-Pagan p = 0.024).
+
+As a result, its standard intervals are probably too narrow.
+
+## Slide 2: Two Alternative Models
+
+Both alternatives use the same four indicators as the current model. The difference is that they also learn from the company's own recent history.
+
+**1. SARIMA (regression with ARIMA errors)** has two parts:
+
+$$\text{Growth}_t = \beta_0 + \beta_1\,\text{Income}_t + \beta_2\,\text{Production}_t + \beta_3\,\text{Savings}_t + \beta_4\,\text{Unemployment}_t + \eta_t$$
+
+$$\eta_t = \phi\,\eta_{t-1} + \varepsilon_t + \theta\,\varepsilon_{t-1}$$
+
+Fitted on all data through 2025 Q2:
+
+$$\text{Growth}_t = 0.239 + 0.761\,\text{Income}_t + 0.049\,\text{Production}_t - 0.054\,\text{Savings}_t - 0.147\,\text{Unemployment}_t + \eta_t$$
+
+$$\eta_t = -0.756\,\eta_{t-1} + \varepsilon_t + 0.643\,\varepsilon_{t-1}, \qquad \sigma^2 = 0.095$$
+
+- The first line is the same regression we use today.
+- The second line models the "surprise," the part of growth the economy doesn't explain. Instead of assuming each quarter's surprise is independent, it lets this quarter's surprise depend on last quarter's.
+- In our data, the two error terms have opposite signs and largely offset each other. The net effect is a mild give-back: when growth beats what the economy predicted, part of that excess tends to reverse the next quarter.
+- The automatic selection procedure first chose a version that modeled quarter-to-quarter *changes* in growth. That version showed a classic sign of being over-adjusted (a moving-average term of −0.98, almost exactly cancelling the change) and left correlated errors. Growth is already a rate of change with no long-run drift, so we fit growth directly. The final model uses ARIMA(1,0,1) errors.
+- Seasonal (quarterly) terms were considered and not selected.
+
+**2. Prophet** is a forecasting model developed by Meta. It breaks growth into a smooth baseline trend that can shift over time, a repeating within-year pattern, and the effects of the four indicators. It is more flexible than MLR or SARIMA, but also more complex and harder to interpret.
+
+**How we got their 2025 projections:** The same two-stage approach as Slide 1, except that each model forecasts the indicators its own way. SARIMA uses an automatically selected time-series model for each indicator, and Prophet uses a separate Prophet model for each indicator.
+
+## Slide 3: Model Comparison and Recommendation
+
+**Testing method:** Every model was trained on data through 2024 Q2 and asked to predict 2024 Q3 – 2025 Q2, which were hidden from it. We ran this two ways:
+
+- **Actual indicators:** each model was given the real indicator values for those quarters. This isolates how good each growth model is.
+- **Forecasted indicators:** each model first had to forecast the indicators, just as it will for 2025. This shows realistic forecast accuracy.
+
+We measured accuracy with RMSE, the typical prediction error in percentage points (lower is better). As a check, we repeated the test using only the last three quarters.
+
+| Model | Actual indicators (4 qtrs) | Actual indicators (3 qtrs) | Forecasted indicators (4 qtrs) |
+|---|---|---|---|
+| Prophet | **0.177** | **0.204** | 0.329 |
+| SARIMA | 0.186 | 0.206 | 0.361 |
+| MLR (current) | 0.194 | 0.214 | **0.319** |
+| Historical average only | 0.358 | 0.408 | 0.358 |
+
+**What the results show:**
+
+- **With actual indicators, both alternatives beat the current model.** Prophet was slightly most accurate, followed by SARIMA. The three-quarter check gave the same ranking.
+- **All models missed the first half of 2025 in the same direction.** They predicted about 0.5% for Q1 (actual: 0.28%) and 0.84–0.92% for Q2 (actual: 1.11%).
+- **With forecasted indicators, errors rose to 0.32–0.36 for every model**, close to simply predicting the average. The biggest source of error is predicting the economy, not the choice of growth model. When given the *same* indicator forecasts, SARIMA and MLR scored almost identically (0.318 vs. 0.319).
+- **The differences between models are small** and based on only four quarters, so they should be read as modest, not decisive.
+
+**2025 projections compared (95% intervals in parentheses):**
+
+| Quarter | MLR (current) | SARIMA | Prophet |
+|---|---|---|---|
+| Q3 2025 | 0.77% (0.15, 1.38) | 0.63% (0.02, 1.23) | 0.64% (0.05, 1.21) |
+| Q4 2025 | 0.66% (0.04, 1.27) | 0.77% (0.17, 1.38) | 0.56% (−0.02, 1.14) |
+
+- **All three project positive growth of roughly 0.55–0.8% per quarter, and their intervals overlap almost completely.**
+- **Part of their disagreement comes from different indicator forecasts.** For example, the Q3 savings forecast ranges from −2.1 to +3.3 depending on the method.
+- **These intervals assume the indicator forecasts are correct.** Slide 1's simulation suggests the real uncertainty is closer to ±1.3 percentage points.
+
+**Recommendation: move from MLR to SARIMA.**
+
+1. **More accurate than the current model:** 0.186 vs. 0.194, and 0.206 vs. 0.214 on the three-quarter check.
+2. **Statistically sound.** It is the only model whose errors pass the test for leftover correlation between quarters (Ljung-Box p = 0.064, vs. 0.029 for MLR and 0.010 for Prophet), so its confidence and prediction intervals are more trustworthy.
+3. **Simple and interpretable.** It is the regression the board already knows plus one correction term for last quarter's surprise, and it gives clear indicator effects with confidence intervals (Slide 4).
+
+**Why not Prophet?** Prophet had the lowest error, but its edge over SARIMA is small: about 0.01 points on four quarters and 0.002 on three, so one quarter could flip the ranking. In exchange, it is more complex, leaves correlated errors, and does not provide confidence intervals for the indicator effects the board asked about. We judged that a small, uncertain accuracy gain wasn't worth those costs.
+
+**One caveat:** switching models will not fix the larger challenge. Our 2025 forecasts are only as good as our forecasts of the economy.
+
+## Slide 4: How the Economic Indicators Relate to Growth (SARIMA)
+
+Holding the other indicators constant:
+
+- **Disposable income:** a one-unit increase is associated with **0.761 percentage points higher** quarterly growth (95% CI: 0.685 to 0.837). This is by far the strongest driver, consistent with VistaLux selling discretionary, high-end products.
+- **US production:** a one-unit increase is associated with **0.049 percentage points higher** growth (95% CI: 0.006 to 0.092). This is a small but real positive effect.
+- **Personal savings:** a one-unit increase is associated with **0.054 percentage points lower** growth (95% CI: −0.0598 to −0.0485). When households save more, they spend less on optional purchases. Because this indicator swings widely (roughly −60 to +40), a 10-unit rise corresponds to about 0.5 points lower growth.
+- **Unemployment:** changes in the unemployment rate do **not** have a statistically significant relationship with growth once the other three are accounted for (95% CI: −0.328 to 0.034).
+
+The current MLR model gives nearly identical estimates, so these conclusions hold regardless of which model is used. SARIMA's intervals are more trustworthy because they account for the quarter-to-quarter correlation that MLR ignores.
+
+**Limitations:**
+
+- Prediction errors are heavier-tailed than a normal distribution, so stated intervals are approximate.
+- The model comparison rests on only four test quarters.
+- The 2025 projections depend heavily on forecasts of the economic indicators. The SARIMA and Prophet intervals shown do not include that extra uncertainty.
+- All three models show a leftover dip in residual correlation at lag 7 (quarters about seven apart), which none of them captures; it is unlikely to affect two-quarter-ahead forecasts.
